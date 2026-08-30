@@ -19,7 +19,7 @@ use tracing::{info, warn};
 use crate::config::{ConfigManager, VolteConfig};
 use crate::models::{VolteControlResponse, VolteRuntimeStatusResponse};
 use crate::volte::identity::ImsIdentity;
-use crate::volte::runtime::{Phase, RuntimeCommand, Stage, VolteSupervisor};
+use crate::volte::runtime::{Phase, RegistrationMode, RuntimeCommand, Stage, VolteSupervisor};
 use crate::volte::slot::DataPathMode;
 use crate::volte::ApnProtocol;
 use crate::volte::VolteConfig as VolteRuntimeConfig;
@@ -449,9 +449,12 @@ impl VolteManager {
         );
 
         // 确保路由存在（NM 可能没配 P-CSCF 路由）。
-        let _ = sh(&format!(
-            "ip -6 route replace {pcscf_str}/128 dev wwan1 metric 5 2>/dev/null"
-        ));
+        let _ = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "ip -6 route replace {pcscf_str}/128 dev wwan1 metric 5 2>/dev/null"
+            ))
+            .output();
 
         // ---- stage: register (SIP over IPsec) ----
         {
@@ -487,14 +490,17 @@ impl VolteManager {
             .map_err(|e| format!("volte_register JSON parse: {e}"))?;
 
         if result["registered"].as_bool() == Some(true) {
-            let registered_pcscf = result["pcscf"].as_str().unwrap_or(&pcscf_str);
-            let registered_ue = result["ue_addr"].as_str().unwrap_or(&local);
+            let registered_pcscf = result["pcscf"].as_str().unwrap_or(pcscf_str.as_str());
+            let registered_ue = result["ue_addr"].as_str().unwrap_or(local.as_str());
             {
                 let mut snap = identity.lock().await;
                 snap.pcscf = Some(registered_pcscf.to_string());
                 snap.ue_address = Some(registered_ue.to_string());
             }
-            sup.registered(RegistrationMode::Ipsec);
+            {
+                let mut sup = supervisor.lock().await;
+                sup.registered(RegistrationMode::Ipsec);
+            }
             info!(
                 target: "simadmin::volte",
                 pcscf = registered_pcscf,
@@ -507,10 +513,6 @@ impl VolteManager {
             "volte_register: {}",
             result["error"].as_str().unwrap_or("unknown error")
         ))
-    }
-
-    fn sh(cmd: &str) {
-        let _ = std::process::Command::new("sh").arg("-c").arg(cmd).output();
     }
 }
 
