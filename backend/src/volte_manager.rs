@@ -356,8 +356,16 @@ impl VolteManager {
         let usim_aid = card_status
             .as_deref()
             .and_then(|s| ident_mod::parse_usim_aid(s).ok());
+        // SIM 直接报告 MCC+MNC（如 46001），用它定 MNC 位数比启发式可靠。
+        let operator_code = read_operator_code().await;
 
-        let id = ident_mod::build(&imsi, None, None, usim_aid, None)?;
+        let id = ident_mod::build(
+            &imsi,
+            None,
+            operator_code.as_deref(),
+            usim_aid,
+            None,
+        )?;
         {
             let mut snap = identity.lock().await;
             *snap = VolteIdentitySnapshot::from_identity(&id);
@@ -466,14 +474,72 @@ async fn run_at(cmd: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// 从 mmcli 的 AT 响应里剥出裸内容。
+///
+/// mmcli 不会原样吐出模组回复，而是包一层：
+///
+/// ```text
+/// response: '460018558516337'
+/// ```
+///
+/// 早先的实现要求整行全是数字，于是这种带前缀和引号的输出永远匹配不上 ——
+/// 明明命令成功了却被判成失败（`volte_imsi_missing`）。
+pub fn strip_mmcli_response(raw: &str) -> String {
+    let mut out = String::new();
+    for line in raw.lines() {
+        let t = line.trim();
+        let body = match t.strip_prefix("response:") {
+            Some(r) => r.trim(),
+            None => t,
+        };
+        let body = body.trim_matches('\'').trim_matches('"').trim();
+        if body.is_empty() || body == "OK" {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(body);
+    }
+    out
+}
+
+/// 从 mmcli SIM 对象读一个字段。
+///
+/// IMSI 不挂在 modem 对象上，只在 SIM 对象上：
+/// `mmcli -i <idx> --output-keyvalue` → `sim.properties.imsi`。
+/// 之前查 `mmcli -m any --output-keyvalue` 的 imsi 字段，实测 0 命中。
+async fn sim_property(key: &str) -> Option<String> {
+    // SIM 索引通常与 modem 索引一致；先试 0，再从 modem 属性里解析真实路径。
+    for idx in ["0", "1"] {
+        let out = tokio::process::Command::new("mmcli")
+            .args(["-i", idx, "--output-keyvalue"])
+            .output()
+            .await
+            .ok()?;
+        if !out.status.success() {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            if let Some((k, v)) = line.split_once(':') {
+                if k.trim() == key {
+                    let v = v.trim();
+                    if !v.is_empty() && v != "--" {
+                        return Some(v.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 async fn read_imsi() -> Result<String, String> {
-    // 先走 AT+CIMI，失败回落到 mmcli 报告的 SIM IMSI。
+    // 首选 AT+CIMI，它直接问模组，不受 MM 缓存影响。
     if let Some(resp) = run_at(crate::volte::identity::AT_CIMI).await {
-        let digits: String = resp
-            .lines()
-            .map(str::trim)
-            .filter(|l| l.len() >= 14 && l.chars().all(|c| c.is_ascii_digit()))
-            .collect();
+        let body = strip_mmcli_response(&resp);
+        let digits: String = body.chars().filter(|c| c.is_ascii_digit()).collect();
         if digits.len() >= 14 {
             return Ok(digits);
         }
@@ -483,23 +549,22 @@ async fn read_imsi() -> Result<String, String> {
         "Native VoLTE ModemManager AT+CIMI failed, using SIM IMSI fallback"
     );
 
-    let out = tokio::process::Command::new("mmcli")
-        .args(["-m", "any", "--output-keyvalue"])
-        .output()
-        .await
-        .map_err(|e| format!("{}: {e}", crate::volte::err::COMMAND_SPAWN_FAILED))?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    for line in text.lines() {
-        if let Some((k, v)) = line.split_once(':') {
-            if k.trim().ends_with("sim.properties.imsi") || k.trim().ends_with("imsi") {
-                let d: String = v.chars().filter(|c| c.is_ascii_digit()).collect();
-                if d.len() >= 14 {
-                    return Ok(d);
-                }
+    match sim_property("sim.properties.imsi").await {
+        Some(v) => {
+            let digits: String = v.chars().filter(|c| c.is_ascii_digit()).collect();
+            if digits.len() >= 14 {
+                Ok(digits)
+            } else {
+                Err(crate::volte::err::MM_IMSI_MISSING.to_string())
             }
         }
+        None => Err(crate::volte::err::IMSI_MISSING.to_string()),
     }
-    Err(crate::volte::err::IMSI_MISSING.to_string())
+}
+
+/// SIM 报告的归属运营商码（MCC+MNC），用于确定 MNC 位数而不靠启发式。
+async fn read_operator_code() -> Option<String> {
+    sim_property("sim.properties.operator-code").await
 }
 
 async fn read_card_status() -> Option<String> {
