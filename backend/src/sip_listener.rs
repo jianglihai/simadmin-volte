@@ -28,6 +28,29 @@ lazy_static::lazy_static! {
     /// 期望监听的 UE 地址：重注册后地址可能变化（承载重连 -> 新 SLAAC），
     /// 监听任务定期核对并重绑。
     static ref DESIRED_UE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    /// 近期已入库的 (sender|text)：网络重发时 SCTS 会变，pdu 标记失效，
+    /// 用内存近时记录兜底（重发间隔为秒级，进程重启丢失无碍）。
+    static ref RECENT_SMS: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> =
+        std::sync::Mutex::new(std::collections::HashMap::new());
+}
+
+const RECENT_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+fn recent_seen(sender: &str, text: &str) -> bool {
+    let key = format!("{sender}|{text}");
+    let mut map = match RECENT_SMS.lock() {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    map.retain(|_, t| t.elapsed() < RECENT_TTL);
+    map.contains_key(&key)
+}
+
+fn remember_recent(sender: &str, text: &str) {
+    if let Ok(mut map) = RECENT_SMS.lock() {
+        map.retain(|_, t| t.elapsed() < RECENT_TTL);
+        map.insert(format!("{sender}|{text}"), std::time::Instant::now());
+    }
 }
 
 /// 注册成功后调用；进程内只启动一次，重复调用只更新目标地址。
@@ -146,15 +169,22 @@ async fn handle_packet(
     let rp = match decode_rp_data(body) {
         Ok(v) => v,
         Err(e) => {
-            warn!(target: "simadmin::volte", error = %e, "MT RP-DATA decode failed");
-            return Some(build_response(&head, None, "400 Bad RP-DATA"));
+            // 网络会重发直到收到 RP-ACK；未知格式也尽量按参考号回 ACK，
+            // 避免 400 触发持续重传。
+            warn!(target: "simadmin::volte", error = %e,
+                  head_hex = %body.iter().take(16).map(|b| format!("{b:02x}")).collect::<String>(),
+                  "MT RP-DATA decode failed, acking anyway");
+            let reference = body.get(1).copied().unwrap_or(0);
+            return Some(build_response(&head, Some(reference), "200 OK"));
         }
     };
     let deliver = match decode_sms_deliver(&rp.tpdu) {
         Ok(v) => v,
         Err(e) => {
-            warn!(target: "simadmin::volte", error = %e, "MT SMS-DELIVER decode failed");
-            return Some(build_response(&head, None, "400 Bad TPDU"));
+            warn!(target: "simadmin::volte", error = %e,
+                  tpdu_hex = %rp.tpdu.iter().take(16).map(|b| format!("{b:02x}")).collect::<String>(),
+                  "MT SMS-DELIVER decode failed, acking anyway");
+            return Some(build_response(&head, Some(rp.reference), "200 OK"));
         }
     };
 
@@ -173,7 +203,7 @@ async fn handle_packet(
         MultipartOutcome::Complete { sender, text } => (sender, text),
     };
 
-    // 重传去重：同一 (sender, scts, text) 只入库一次。
+    // 重传去重：pdu 精确标记 + 近时内容兜底（网络重发时 SCTS 可能变化）。
     let marker = duplicate_key(&sender, &deliver.scts, &text);
     match db.sms_exists_by_pdu(&marker) {
         Ok(true) => {
@@ -183,11 +213,16 @@ async fn handle_packet(
         Ok(false) => {}
         Err(e) => warn!(target: "simadmin::volte", error = %e, "MT dedup check failed"),
     }
+    if recent_seen(&sender, &text) {
+        info!(target: "simadmin::volte", sender = %sender, "IMS MT SMS recent duplicate, ack only");
+        return Some(build_response(&head, Some(rp.reference), "200 OK"));
+    }
 
     let now = beijing_sms_now_string();
     match db.insert_sms_at("incoming", &sender, &text, &now, "received", Some(&marker)) {
         Ok(id) => {
             info!(target: "simadmin::volte", sender = %sender, id, "IMS MT SMS stored");
+            remember_recent(&sender, &text);
             let sms = SmsMessage {
                 id,
                 direction: "incoming".to_string(),
