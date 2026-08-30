@@ -6,3 +6,6 @@
 **/*.rs.bk
 .DS_Store
 .commitmsg
+frontend/pnpm-workspace.yaml
+.watch_run.py
+.push_via_api.py
