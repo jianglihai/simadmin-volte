@@ -58,7 +58,7 @@ async fn run(db: Arc<Database>, notifier: Arc<NotificationSender>) -> Result<(),
     let mut bound_ue: Option<String> = None;
     loop {
         // 地址变化（或首次）时重绑。
-        let want = DESIRED_UE.lock().ok().and_then(|g| g.as_ref().clone());
+        let want = DESIRED_UE.lock().ok().and_then(|g| g.clone());
         if bound_ue != want {
             drop(socket.take());
             bound_ue = None;
