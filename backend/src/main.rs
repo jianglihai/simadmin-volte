@@ -47,6 +47,7 @@ mod ota;
 mod secondary_qmi;
 mod secondary_qmi_data;
 mod serial;
+mod sip_listener;
 mod sms_listener;
 mod state;
 mod system_event;

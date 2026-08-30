@@ -89,7 +89,11 @@ impl AppState {
             cell_monitoring_active,
         } = dependencies;
         // VoLTE 管理器只依赖配置，直接在这里构造，避免调用方都要传一遍。
-        let volte_manager = Arc::new(VolteManager::new(Arc::clone(&config_manager)));
+        let volte_manager = Arc::new(VolteManager::new(
+            Arc::clone(&config_manager),
+            Arc::clone(&database),
+            Arc::clone(&notification_sender),
+        ));
         Self {
             dbus_conn,
             database,

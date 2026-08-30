@@ -17,7 +17,9 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
 use crate::config::{ConfigManager, VolteConfig};
+use crate::db::Database;
 use crate::models::{VolteControlResponse, VolteRuntimeStatusResponse};
+use crate::notification::NotificationSender;
 use crate::volte::identity::ImsIdentity;
 use crate::volte::runtime::{Phase, RegistrationMode, RuntimeCommand, Stage, VolteSupervisor};
 use crate::volte::slot::DataPathMode;
@@ -54,10 +56,16 @@ pub struct VolteManager {
     identity: Arc<Mutex<VolteIdentitySnapshot>>,
     command_tx: Arc<Mutex<Option<mpsc::Sender<RuntimeCommand>>>>,
     config_manager: Arc<ConfigManager>,
+    database: Arc<Database>,
+    notifier: Arc<NotificationSender>,
 }
 
 impl VolteManager {
-    pub fn new(config_manager: Arc<ConfigManager>) -> Self {
+    pub fn new(
+        config_manager: Arc<ConfigManager>,
+        database: Arc<Database>,
+        notifier: Arc<NotificationSender>,
+    ) -> Self {
         let cfg = config_manager.get_volte_config();
         Self {
             supervisor: Arc::new(Mutex::new(VolteSupervisor::new(
@@ -67,6 +75,8 @@ impl VolteManager {
             identity: Arc::new(Mutex::new(VolteIdentitySnapshot::default())),
             command_tx: Arc::new(Mutex::new(None)),
             config_manager,
+            database,
+            notifier,
         }
     }
 
@@ -247,6 +257,8 @@ impl VolteManager {
         let supervisor = Arc::clone(&self.supervisor);
         let identity = Arc::clone(&self.identity);
         let config_manager = Arc::clone(&self.config_manager);
+        let database = Arc::clone(&self.database);
+        let notifier = Arc::clone(&self.notifier);
 
         tokio::spawn(async move {
             info!(target: "simadmin::volte", "Native VoLTE supervisor worker started");
@@ -272,6 +284,8 @@ impl VolteManager {
                     &rt_cfg,
                     Arc::clone(&supervisor),
                     Arc::clone(&identity),
+                    Arc::clone(&database),
+                    Arc::clone(&notifier),
                 )
                 .await
                 {
@@ -342,6 +356,8 @@ impl VolteManager {
         cfg: &VolteRuntimeConfig,
         supervisor: Arc<Mutex<VolteSupervisor>>,
         identity: Arc<Mutex<VolteIdentitySnapshot>>,
+        database: Arc<Database>,
+        notifier: Arc<NotificationSender>,
     ) -> Result<(), String> {
         use crate::volte::{bearer, identity as ident_mod, pcscf};
 
@@ -525,6 +541,8 @@ impl VolteManager {
                 pcscf = %registered_pcscf,
                 "Native VoLTE runtime registered with 3GPP IPsec and listening"
             );
+            // MT 短信监听：网络因 Contact 带 +g.3gpp.smsip 会优先走 IMS 投递。
+            crate::sip_listener::spawn_mt_listener(registered_ue.clone(), database, notifier);
             return Ok(());
         }
 
