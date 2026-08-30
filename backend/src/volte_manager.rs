@@ -490,20 +490,24 @@ impl VolteManager {
             .map_err(|e| format!("volte_register JSON parse: {e}"))?;
 
         if result["registered"].as_bool() == Some(true) {
-            let registered_pcscf = result["pcscf"].as_str().unwrap_or(pcscf_str.as_str());
-            let registered_ue = result["ue_addr"].as_str().unwrap_or(local.as_str());
+            let registered_pcscf = result["pcscf"].as_str().unwrap_or(pcscf_str.as_str()).to_string();
+            let registered_ue = result["ue_addr"].as_str().unwrap_or("").to_string();
             {
                 let mut snap = identity.lock().await;
-                snap.pcscf = Some(registered_pcscf.to_string());
-                snap.ue_address = Some(registered_ue.to_string());
+                snap.pcscf = Some(registered_pcscf.clone());
+                snap.ue_address = Some(registered_ue.clone());
             }
             {
                 let mut sup = supervisor.lock().await;
-                sup.registered(RegistrationMode::Ipsec);
+                sup.registered(
+                    RegistrationMode::Ipsec,
+                    now_unix(),
+                    DataPathMode::IndependentWwan1,
+                );
             }
             info!(
                 target: "simadmin::volte",
-                pcscf = registered_pcscf,
+                pcscf = %registered_pcscf,
                 "Native VoLTE runtime registered with 3GPP IPsec and listening"
             );
             return Ok(());
