@@ -1,0 +1,232 @@
+name: Build lpac compatibility bundles
+
+# Build self-contained lpac bundles for the oldest supported glibc baseline.
+# They ship their own libqmi, avoiding a host libqmi ABI dependency.
+
+on:
+  schedule:
+    - cron: '0 0 5,20 * *'
+  workflow_dispatch:
+    inputs:
+      lpac_ref:
+        description: 'Official lpac branch, tag, or commit (for example: v2.3.0)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    name: Resolve lpac source
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      lpac_ref: ${{ steps.check.outputs.lpac_ref }}
+      compat_revision: ${{ steps.check.outputs.compat_revision }}
+    steps:
+      - name: Check whether compatibility assets need rebuilding
+        id: check
+        env:
+          MANUAL_REF: ${{ inputs.lpac_ref }}
+          CURRENT_REPOSITORY: ${{ github.repository }}
+          COMPAT_REVISION: "2"
+        run: |
+          set -euo pipefail
+          official_tag="$(curl -fsSL https://api.github.com/repos/estkme-group/lpac/releases/latest | jq -r .tag_name)"
+          lpac_ref="${MANUAL_REF:-$official_tag}"
+          manifest="$(curl -fsSL "https://github.com/${CURRENT_REPOSITORY}/releases/download/lpac/lpac.json" || printf '{}')"
+          bundled_version="$(printf '%s' "$manifest" | jq -r '.version // empty')"
+          bundled_revision="$(printf '%s' "$manifest" | jq -r '.compat_revision // empty')"
+          has_all_assets="$(printf '%s' "$manifest" | jq -r '
+            [.assets[]?.name] as $assets
+            | (["lpac-linux-aarch64-glibc2.31.zip", "lpac-linux-x86_64-glibc2.31.zip"]
+              | all(. as $name | $assets | index($name)))
+          ' 2>/dev/null || printf false)"
+
+          echo "lpac_ref=$lpac_ref" >> "$GITHUB_OUTPUT"
+          echo "compat_revision=$COMPAT_REVISION" >> "$GITHUB_OUTPUT"
+          if [ "$MANUAL_REF" = "" ] \
+            && [ "$bundled_version" = "$official_tag" ] \
+            && [ "$bundled_revision" = "$COMPAT_REVISION" ] \
+            && [ "$has_all_assets" = "true" ]; then
+            echo "Compatibility bundles already match $official_tag."
+            echo 'should_build=false' >> "$GITHUB_OUTPUT"
+          else
+            echo "Building compatibility bundles from $lpac_ref."
+            echo 'should_build=true' >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build ${{ matrix.arch }} compatibility bundle
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            asset: lpac-linux-aarch64-glibc2.31.zip
+          - arch: x86_64
+            runner: ubuntu-latest
+            asset: lpac-linux-x86_64-glibc2.31.zip
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Build lpac with bundled libqmi in Debian 11
+        env:
+          LPAC_REF: ${{ needs.prepare.outputs.lpac_ref }}
+          ASSET_NAME: ${{ matrix.asset }}
+          COMPAT_REVISION: ${{ needs.prepare.outputs.compat_revision }}
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          docker run --rm \
+            -e LPAC_REF -e ASSET_NAME -e COMPAT_REVISION \
+            -v "$GITHUB_WORKSPACE/release:/output" \
+            debian:11 bash -c '
+              set -eux
+
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                build-essential binutils cmake git ca-certificates zip \
+                pkg-config python3 python3-pip ninja-build \
+                libcurl4-openssl-dev libglib2.0-dev \
+                libmbim-glib-dev \
+                libpcsclite-dev libgudev-1.0-dev libglib2.0-doc \
+                libudev-dev udev
+              pip3 install meson
+
+              git clone --depth 1 --branch 1.36.0 \
+                https://gitlab.freedesktop.org/mobile-broadband/libqmi.git /libqmi-src
+              meson setup /libqmi-src/build /libqmi-src \
+                --prefix=/usr/local --libdir=lib --buildtype=release \
+                -Dcollection=full -Dmbim_qmux=false -Dqrtr=false \
+                -Dintrospection=false -Dman=false -Dbash_completion=false \
+                -Dqmi_username=root
+              ninja -C /libqmi-src/build
+              ninja -C /libqmi-src/build install
+              ldconfig
+
+              git clone --depth 1 --branch "$LPAC_REF" \
+                https://github.com/estkme-group/lpac /lpac
+              cmake -S /lpac -B /lpac/build \
+                -DCMAKE_BUILD_TYPE=Release -DSTANDALONE_MODE=ON \
+                -DLPAC_WITH_APDU_PCSC=OFF -DLPAC_WITH_APDU_AT=ON \
+                -DLPAC_WITH_APDU_QMI=ON -DLPAC_WITH_APDU_MBIM=ON \
+                -DCMAKE_INSTALL_RPATH="\$ORIGIN/lib"
+              cmake --build /lpac/build --parallel
+              DESTDIR=/tmp/lpac-install cmake --install /lpac/build
+
+              bundle=/tmp/lpac-bundle
+              mkdir -p "$bundle/lib"
+              lpac_bin="$(find /tmp/lpac-install -type f -name lpac -print -quit)"
+              test -n "$lpac_bin"
+              install -m 0755 "$lpac_bin" "$bundle/lpac"
+
+              qmi_so="$(find /usr/local/lib -type f -name "libqmi-glib.so.*.*.*" -print -quit)"
+              test -n "$qmi_so"
+              cp -L "$qmi_so" "$bundle/lib/"
+              qmi_basename="$(basename "$qmi_so")"
+              ln -s "$qmi_basename" "$bundle/lib/libqmi-glib.so.5"
+              ln -s "$qmi_basename" "$bundle/lib/libqmi-glib.so"
+
+              mbim_so="$(find /usr/lib /usr/local/lib -type f -name "libmbim-glib.so.*.*.*" -print -quit)"
+              test -n "$mbim_so"
+              cp -L "$mbim_so" "$bundle/lib/"
+              mbim_basename="$(basename "$mbim_so")"
+              mbim_soname="$(readelf -d "$mbim_so" | sed -n "s/.*SONAME.*\[\(.*\)\].*/\1/p")"
+              test -n "$mbim_soname"
+              ln -s "$mbim_basename" "$bundle/lib/$mbim_soname"
+              ln -s "$mbim_basename" "$bundle/lib/libmbim-glib.so"
+              printf "%s\n" "$COMPAT_REVISION" > "$bundle/COMPAT_REVISION.txt"
+
+              readelf -d "$bundle/lpac" | grep -E "\(RPATH\)|\(RUNPATH\)" | grep -F ORIGIN/lib
+              ldd "$bundle/lpac" | grep -F "$bundle/lib/libqmi-glib.so.5"
+              ldd "$bundle/lpac" | grep -F "$bundle/lib/$mbim_soname"
+              LPAC_APDU=stdio LPAC_HTTP=stdio "$bundle/lpac" driver list \
+                | tee /tmp/lpac-drivers.json
+              grep -Fq qmi /tmp/lpac-drivers.json
+              grep -Fq mbim /tmp/lpac-drivers.json
+              grep -Fq at_csim /tmp/lpac-drivers.json
+              grep -Fq curl /tmp/lpac-drivers.json
+
+              cd "$bundle"
+              zip -qr "/output/$ASSET_NAME" .
+              chmod 0644 "/output/$ASSET_NAME"
+            '
+
+      - name: Verify bundle contents
+        run: |
+          set -euo pipefail
+          unzip -l "release/${{ matrix.asset }}"
+          unzip -p "release/${{ matrix.asset }}" lpac >/dev/null
+
+      - name: Upload compatibility bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: lpac-${{ matrix.arch }}
+          path: release/${{ matrix.asset }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish lpac compatibility assets
+    needs: [prepare, build]
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download bundles
+        uses: actions/download-artifact@v4
+        with:
+          pattern: lpac-*
+          path: release
+          merge-multiple: true
+
+      - name: Generate manifest and checksums
+        env:
+          LPAC_REF: ${{ needs.prepare.outputs.lpac_ref }}
+          COMPAT_REVISION: ${{ needs.prepare.outputs.compat_revision }}
+        run: |
+          set -euo pipefail
+          test -f release/lpac-linux-aarch64-glibc2.31.zip
+          test -f release/lpac-linux-x86_64-glibc2.31.zip
+          sha256sum release/lpac-linux-*.zip > release/SHA256SUMS
+          cat > release/lpac.json <<EOF
+          {
+            "version": "${LPAC_REF}",
+            "compat_revision": "${COMPAT_REVISION}",
+            "assets": [
+              {
+                "name": "lpac-linux-aarch64-glibc2.31.zip",
+                "arch": "aarch64",
+                "glibc": "2.31",
+                "description": "lpac with bundled libqmi for aarch64"
+              },
+              {
+                "name": "lpac-linux-x86_64-glibc2.31.zip",
+                "arch": "x86_64",
+                "glibc": "2.31",
+                "description": "lpac with bundled libqmi for x86_64"
+              }
+            ]
+          }
+          EOF
+          jq -e . release/lpac.json
+
+      - name: Publish to the compatibility release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: lpac
+          name: eSIM lpac compatibility assets
+          body: |
+            Self-contained lpac builds with bundled libqmi for ARM64 and x86_64.
+            Source: `estkme-group/lpac@${{ needs.prepare.outputs.lpac_ref }}`
+          draft: false
+          prerelease: true
+          make_latest: false
+          files: |
+            release/lpac-linux-*.zip
+            release/lpac.json
+            release/SHA256SUMS
+          token: ${{ secrets.SIMADMIN_RELEASE_TOKEN || github.token }}

@@ -1,0 +1,349 @@
+name: Build-OTA-Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（例如：1.0.0）'
+        required: false
+        type: string
+        default: 'auto'
+      use_upx:
+        description: 'build with upx'
+        required: false
+        type: boolean
+        default: true
+      release_type:
+        description: '发布类型（Release type）'
+        required: true
+        type: choice
+        default: '最新正式版（latest release）'
+        options:
+          - '最新正式版（latest release）'
+          - '预发布版（pre-release）'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      current_version: ${{ steps.version.outputs.current_version }}
+      version_source: ${{ steps.version.outputs.version_source }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read VERSION
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          CURRENT_VERSION=$(tr -d '[:space:]' < VERSION)
+          VERSION=$(printf '%s' "$INPUT_VERSION" | tr -d '[:space:]')
+          if [ -z "$VERSION" ] || [ "$VERSION" = "auto" ]; then
+            VERSION="$CURRENT_VERSION"
+            SOURCE="VERSION file"
+          else
+            SOURCE="workflow input"
+          fi
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+(\.[0-9]+){1,3}([-.][0-9A-Za-z]+)*$'; then
+            echo "Invalid version: $VERSION" >&2
+            exit 1
+          fi
+          {
+            echo "version=$VERSION"
+            echo "current_version=$CURRENT_VERSION"
+            echo "version_source=$SOURCE"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync version numbers
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          printf '%s\n' "$VERSION" > VERSION
+          sed -i "s/^version = \"[^\"]*\"/version = \"$VERSION\"/" backend/Cargo.toml
+          sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" frontend/package.json
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install native build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          if [ "${{ inputs.use_upx }}" = "true" ]; then
+            sudo apt-get install -y upx-ucl
+          fi
+          musl-gcc --version
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build backend
+        env:
+          TARGET: ${{ matrix.target }}
+          SQLITE3_STATIC: '1'
+          LIBSQLITE3_SYS_USE_PKG_CONFIG: '0'
+        run: |
+          case "$TARGET" in
+            aarch64-unknown-linux-musl)
+              export CC_aarch64_unknown_linux_musl=musl-gcc
+              export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+              ;;
+            x86_64-unknown-linux-musl)
+              export CC_x86_64_unknown_linux_musl=musl-gcc
+              export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+              ;;
+          esac
+          cargo build --locked --release --target "$TARGET" -p simadmin
+          file "target/$TARGET/release/simadmin"
+
+      - name: Compress backend with UPX
+        if: inputs.use_upx == true
+        env:
+          TARGET: ${{ matrix.target }}
+        run: upx --best --lzma "target/$TARGET/release/simadmin"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run lint
+          pnpm exec vite build
+
+      - name: Package OTA
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          ./scripts/pack-ota.sh --target="$TARGET"
+          case "$TARGET" in
+            aarch64-unknown-linux-musl)
+              ARCH_SUFFIX="aarch64"
+              ;;
+            x86_64-unknown-linux-musl)
+              ARCH_SUFFIX="x86_64"
+              ;;
+          esac
+          SOURCE="release/simadmin_${VERSION}_${TARGET}.tar.gz"
+          DEST="release/simadmin-${ARCH_SUFFIX}.tar.gz"
+          mv "$SOURCE" "$DEST"
+
+          sha256sum release/*.tar.gz
+
+      - name: Upload OTA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ota-${{ matrix.target }}
+          path: release/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download OTA artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ota-*
+          path: release
+          merge-multiple: true
+
+      - name: Generate checksums and release notes
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_TYPE: ${{ inputs.release_type }}
+          COMMIT_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          cd release
+          sha256sum -- ./*.tar.gz > SHA256SUMS
+          cd ..
+          BUILD_TIME=$(TZ='Asia/Shanghai' date +'%Y/%m/%d %H:%M:%S')
+          export BUILD_TIME
+          python3 << 'EOF'
+          import os, sys, re, subprocess
+
+          version = os.environ.get('VERSION', '')
+          commit_sha = os.environ.get('COMMIT_SHA', '')
+          release_type = os.environ.get('RELEASE_TYPE', '最新正式版（latest release）')
+          if not release_type:
+              release_type = '最新正式版（latest release）'
+          repository = os.environ.get('REPOSITORY', '3899/SimAdmin')
+          build_time = os.environ.get('BUILD_TIME', '')
+
+          changelog_path = 'docs/changelog.md'
+          changelog_text = ''
+          prev_tag = ''
+
+          if os.path.exists(changelog_path):
+              with open(changelog_path, 'r', encoding='utf-8') as f:
+                  content = f.read()
+              
+              pattern = rf'### 📌 v{re.escape(version)}\s*\n(.*?)(?=\n### 📌 v|\Z)'
+              match = re.search(pattern, content, re.DOTALL)
+              if match:
+                  changelog_text = match.group(1).strip()
+              
+              versions = re.findall(r'### 📌 v(\d+\.\d+\.\d+)', content)
+              if version in versions:
+                  idx = versions.index(version)
+                  if idx + 1 < len(versions):
+                      prev_tag = f'v{versions[idx + 1]}'
+
+          if not prev_tag:
+              try:
+                  tags = subprocess.check_output(['git', 'tag', '--sort=-v:refname'], text=True).strip().splitlines()
+                  tags = [t for t in tags if t.startswith('v') and t != f'v{version}']
+                  if tags:
+                      prev_tag = tags[0]
+              except Exception:
+                  pass
+
+          if not prev_tag:
+              prev_tag = 'v1.0.0'
+
+          if not changelog_text:
+              changelog_text = '- 详见 Commit 提交记录。'
+
+          full_changelog_line = f'**Full Changelog**: https://github.com/{repository}/compare/{prev_tag}...v{version}'
+
+          body = (
+              f'### 版本信息\n\n'
+              f'- **版本**: {version}\n'
+              f'- **Commit**: {commit_sha}\n'
+              f'- **构建时间**: {build_time}\n'
+              f'- **发布类型**: {release_type}\n'
+              f'- **资产包**: \n'
+              f'\t- **aarch64 (ARM64)**: `simadmin-aarch64.tar.gz`\n'
+              f'\t- **x86_64 (AMD64)**: `simadmin-x86_64.tar.gz`\n\n'
+              f'### 更新说明\n\n'
+              f'{changelog_text}\n\n\n'
+              f'{full_changelog_line}\n'
+          )
+
+          with open('release/RELEASE_BODY.md', 'w', encoding='utf-8') as f:
+              f.write(body)
+          EOF
+
+      - name: Publish OTA packages
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.prepare.outputs.version }}
+          name: SimAdmin_v${{ needs.prepare.outputs.version }}
+          files: |
+            release/simadmin-aarch64.tar.gz
+            release/simadmin-x86_64.tar.gz
+          body_path: release/RELEASE_BODY.md
+          overwrite_files: true
+          generate_release_notes: false
+          draft: false
+          prerelease: ${{ inputs.release_type == '预发布版（pre-release）' }}
+          make_latest: ${{ inputs.release_type == '最新正式版（latest release）' }}
+          token: ${{ secrets.SIMADMIN_RELEASE_TOKEN || github.token }}
+
+      - name: Build summary
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_TYPE: ${{ inputs.release_type }}
+          COMMIT_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          BUILD_TIME=$(TZ='Asia/Shanghai' date +'%Y/%m/%d %H:%M:%S')
+          export BUILD_TIME
+          python3 << 'EOF'
+          import os
+
+          version = os.environ.get('VERSION', '')
+          commit_sha = os.environ.get('COMMIT_SHA', '')
+          release_type = os.environ.get('RELEASE_TYPE', '最新正式版（latest release）')
+          if not release_type:
+              release_type = '最新正式版（latest release）'
+          repository = os.environ.get('REPOSITORY', '3899/SimAdmin')
+          build_time = os.environ.get('BUILD_TIME', '')
+
+          sums = {}
+          sums_file = 'release/SHA256SUMS'
+          if os.path.exists(sums_file):
+              with open(sums_file, 'r', encoding='utf-8') as f:
+                  for line in f:
+                      parts = line.strip().split()
+                      if len(parts) >= 2:
+                          h, fn = parts[0], os.path.basename(parts[1])
+                          sums[fn] = h
+
+          aarch64_hash = sums.get('simadmin-aarch64.tar.gz', 'N/A')
+          x86_64_hash = sums.get('simadmin-x86_64.tar.gz', 'N/A')
+
+          release_url = f'https://github.com/{repository}/releases/tag/v{version}'
+
+          summary = (
+              f'## 🚀 SimAdmin OTA 多架构构建完成\n\n'
+              f'### 📌 版本与构建元数据\n\n'
+              f'- **版本**: `{version}`\n'
+              f'- **Commit**: `{commit_sha}`\n'
+              f'- **构建时间**: `{build_time}`\n'
+              f'- **发布类型**: {release_type}\n\n'
+              f'### 📦 资产包与 SHA-256 校验和\n\n'
+              f'| 架构 / 平台 | 文件名 | SHA-256 校验和 |\n'
+              f'| :--- | :--- | :--- |\n'
+              f'| **aarch64 / arm64** | `simadmin-aarch64.tar.gz` | `{aarch64_hash}` |\n'
+              f'| **x86_64 / amd64** | `simadmin-x86_64.tar.gz` | `{x86_64_hash}` |\n\n'
+              f'---\n'
+              f'🎉 Release 发布完成: [{repository}_v{version}]({release_url})\n'
+          )
+
+          step_summary = os.environ.get('GITHUB_STEP_SUMMARY')
+          if step_summary:
+              with open(step_summary, 'a', encoding='utf-8') as f:
+                  f.write(summary)
+          EOF
