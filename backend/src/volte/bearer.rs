@@ -46,6 +46,11 @@ pub fn at_define_context(cid: u32, proto: ApnProtocol) -> String {
     )
 }
 
+/// Activate a PDP context.
+pub fn at_activate_context(cid: u32) -> String {
+    format!("AT+CGACT=1,{cid}")
+}
+
 /// Deactivate a context (used when reclaiming a stale lease).
 pub fn at_deactivate_context(cid: u32) -> String {
     format!("AT+CGACT=0,{cid}")

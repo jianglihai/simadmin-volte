@@ -416,8 +416,11 @@ impl VolteManager {
         )
         .unwrap_or(2); // fallback to CID 2 (standard IMS CID)
 
-        // 确保 P-CSCF 上报已启用。
+        // 确保 P-CSCF 上报已启用，且承载已激活。
         let _ = run_at(&pcscf::at_enable_pcscf_reporting(cid)).await;
+        let _ = run_at(&bearer::at_activate_context(cid)).await;
+        // 等待激活完成
+        tokio::time::sleep(Duration::from_secs(8)).await;
 
         // ---- stage: pcscf ----
         {
@@ -425,36 +428,47 @@ impl VolteManager {
             sup.advance(Stage::Pcscf);
         }
         let rdp = run_at(&pcscf::at_read_dynamic_params(cid)).await;
-        let (local, gw, pcscf_list) = match rdp.as_deref().map(pcscf::parse_cgcontrdp) {
-            Some(Ok(v)) => v,
-            _ => return Err(crate::volte::err::RUNTIME_MM_PCSCF_MISSING.to_string()),
+        // QMI 托管承载（MM 走 WDS 会话）下 CGCONTRDP 常为空；此时不再硬失败，
+        // 把发现工作整体交给注册脚本（脚本支持自发现 + 静态候选兜底）。
+        let (local, pcscf_list) = match rdp.as_deref().map(pcscf::parse_cgcontrdp) {
+            Some(Ok((l, _gw, list))) => (Some(l), list),
+            _ => {
+                warn!(
+                    target: "simadmin::volte",
+                    "CGCONTRDP unavailable; delegating discovery to registration script"
+                );
+                (None, Vec::new())
+            }
         };
 
-        let candidates = pcscf::collect_candidates(&[], &[], &pcscf_list, &[])?;
+        let candidates = pcscf::collect_candidates(&[], &[], &pcscf_list, &[])
+            .unwrap_or_default();
         let pcscf_str = candidates
             .first()
             .map(|c| c.addr.to_string())
-            .ok_or_else(|| crate::volte::err::RUNTIME_ALL_PCSCF_FAILED.to_string())?;
+            .unwrap_or_default();
         {
             let mut snap = identity.lock().await;
-            snap.ue_address = Some(local.to_string());
+            snap.ue_address = local.map(|l| l.to_string());
             snap.pcscf = Some(pcscf_str.clone());
         }
         info!(
             target: "simadmin::volte",
             count = candidates.len(),
-            ue = %local,
+            ue = %local.clone().map(|l| l.to_string()).unwrap_or_default(),
             pcscf = %pcscf_str,
             "Native VoLTE P-CSCF candidates discovered from active IMS bearer"
         );
 
         // 确保路由存在（NM 可能没配 P-CSCF 路由）。
-        let _ = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "ip -6 route replace {pcscf_str}/128 dev wwan1 metric 5 2>/dev/null"
-            ))
-            .output();
+        if !pcscf_str.is_empty() {
+            let _ = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "ip -6 route replace {pcscf_str}/128 dev wwan1 metric 5 2>/dev/null"
+                ))
+                .output();
+        }
 
         // ---- stage: register (SIP over IPsec) ----
         {
@@ -465,7 +479,8 @@ impl VolteManager {
         // 运行 Python 注册脚本（含 AKA via QMI proxy + IPsec + SIP REGISTER）。
         // 该脚本已部署为 /opt/simadmin/volte_register.py。
         let reg_out = tokio::process::Command::new("python3")
-            .args(["-u", "/opt/simadmin/volte_register.py", &pcscf_str, &local.to_string()])
+            .args(["-u", "/opt/simadmin/volte_register.py", &pcscf_str,
+                   &local.map(|l| l.to_string()).unwrap_or_default()])
             .env("PYTHONUNBUFFERED", "1")
             .output()
             .await
