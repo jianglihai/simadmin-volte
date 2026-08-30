@@ -396,6 +396,8 @@ impl VolteManager {
         }
 
         // ---- stage: bearer ----
+        // IMS PDN 在模组固件里已经激活（CID 2），不需要创建 bearer。
+        // 只需确认它已激活并获取 CID。
         {
             let mut sup = supervisor.lock().await;
             sup.advance(Stage::Bearer);
@@ -411,10 +413,10 @@ impl VolteManager {
                 .as_deref()
                 .map(bearer::parse_active_contexts)
                 .unwrap_or_default(),
-        )?;
+        )
+        .unwrap_or(2); // fallback to CID 2 (standard IMS CID)
 
-        // 定义 IMS 上下文并打开 P-CSCF 上报。
-        let _ = run_at(&bearer::at_define_context(cid, cfg.apn_protocol)).await;
+        // 确保 P-CSCF 上报已启用。
         let _ = run_at(&pcscf::at_enable_pcscf_reporting(cid)).await;
 
         // ---- stage: pcscf ----
@@ -429,28 +431,86 @@ impl VolteManager {
         };
 
         let candidates = pcscf::collect_candidates(&[], &[], &pcscf_list, &[])?;
+        let pcscf_str = candidates
+            .first()
+            .map(|c| c.addr.to_string())
+            .ok_or_else(|| crate::volte::err::RUNTIME_ALL_PCSCF_FAILED.to_string())?;
         {
             let mut snap = identity.lock().await;
             snap.ue_address = Some(local.to_string());
-            snap.pcscf = candidates.first().map(|c| c.addr.to_string());
+            snap.pcscf = Some(pcscf_str.clone());
         }
         info!(
             target: "simadmin::volte",
             count = candidates.len(),
+            ue = %local,
+            pcscf = %pcscf_str,
             "Native VoLTE P-CSCF candidates discovered from active IMS bearer"
         );
 
-        let _ = gw;
+        // 确保路由存在（NM 可能没配 P-CSCF 路由）。
+        let _ = sh(&format!(
+            "ip -6 route replace {pcscf_str}/128 dev wwan1 metric 5 2>/dev/null"
+        ));
 
-        // ---- stage: register ----
-        // SIP 注册需要 bearer 数据面真正可达 P-CSCF。当前版本先把状态推进到
-        // register_ipsec 并如实报告尚未完成，避免谎报 registered。
+        // ---- stage: register (SIP over IPsec) ----
         {
             let mut sup = supervisor.lock().await;
             sup.advance(Stage::RegisterIpsec);
         }
 
-        Err(crate::volte::err::RUNTIME_ALL_PCSCF_FAILED.to_string())
+        // 运行 Python 注册脚本（含 AKA via QMI proxy + IPsec + SIP REGISTER）。
+        // 该脚本已部署为 /opt/simadmin/volte_register.py。
+        let reg_out = tokio::process::Command::new("python3")
+            .args(["-u", "/opt/simadmin/volte_register.py", &pcscf_str, &local.to_string()])
+            .env("PYTHONUNBUFFERED", "1")
+            .output()
+            .await
+            .map_err(|e| format!("volte_register.py spawn: {e}"))?;
+
+        let stdout = String::from_utf8_lossy(&reg_out.stdout);
+        let stderr = String::from_utf8_lossy(&reg_out.stderr);
+        info!(
+            target: "simadmin::volte",
+            stdout = %stdout,
+            stderr = %stderr,
+            "VoLTE registration script completed"
+        );
+
+        // 解析最后一行 JSON 结果。
+        let json_line = stdout
+            .lines()
+            .rev()
+            .find(|l| l.starts_with('{'))
+            .ok_or_else(|| "volte_register: no JSON output".to_string())?;
+        let result: serde_json::Value = serde_json::from_str(json_line)
+            .map_err(|e| format!("volte_register JSON parse: {e}"))?;
+
+        if result["registered"].as_bool() == Some(true) {
+            let registered_pcscf = result["pcscf"].as_str().unwrap_or(&pcscf_str);
+            let registered_ue = result["ue_addr"].as_str().unwrap_or(&local);
+            {
+                let mut snap = identity.lock().await;
+                snap.pcscf = Some(registered_pcscf.to_string());
+                snap.ue_address = Some(registered_ue.to_string());
+            }
+            sup.registered(RegistrationMode::Ipsec);
+            info!(
+                target: "simadmin::volte",
+                pcscf = registered_pcscf,
+                "Native VoLTE runtime registered with 3GPP IPsec and listening"
+            );
+            return Ok(());
+        }
+
+        Err(format!(
+            "volte_register: {}",
+            result["error"].as_str().unwrap_or("unknown error")
+        ))
+    }
+
+    fn sh(cmd: &str) {
+        let _ = std::process::Command::new("sh").arg("-c").arg(cmd).output();
     }
 }
 
@@ -471,7 +531,8 @@ async fn run_at(cmd: &str) -> Option<String> {
     if !out.status.success() {
         return None;
     }
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    let raw = String::from_utf8_lossy(&out.stdout).into_owned();
+    Some(strip_mmcli_response(&raw))
 }
 
 /// 从 mmcli 的 AT 响应里剥出裸内容。
@@ -488,18 +549,30 @@ pub fn strip_mmcli_response(raw: &str) -> String {
     let mut out = String::new();
     for line in raw.lines() {
         let t = line.trim();
+        // mmcli wraps the response in `response: '...'`
         let body = match t.strip_prefix("response:") {
             Some(r) => r.trim(),
             None => t,
         };
-        let body = body.trim_matches('\'').trim_matches('"').trim();
-        if body.is_empty() || body == "OK" {
-            continue;
+        // Strip surrounding single quotes (mmcli wraps multi-line in one pair)
+        let body = if body.starts_with('\'') && body.ends_with('\'') && body.len() >= 2 {
+            &body[1..body.len() - 1]
+        } else {
+            body
+        };
+        // Unescape literal \r\n sequences (mmcli encodes newlines as escapes
+        // inside the quoted block for multi-line AT responses)
+        let body = body.replace("\\r\\n", "\r\n");
+        for line in body.split("\r\n") {
+            let t = line.trim();
+            if t.is_empty() || t == "OK" {
+                continue;
+            }
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(t);
         }
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(body);
     }
     out
 }
