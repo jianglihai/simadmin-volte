@@ -261,6 +261,7 @@ def register(pcscf, ue):
         log("Security-Server: spi-s=%d port-s=%d" % (pc_spi_s, pc_port_s))
     finally:
         sock.close()
+    service_route = ""
 
     res = ck = ik = None
     for attempt in range(5):
@@ -354,8 +355,15 @@ def register(pcscf, ue):
         log("REGISTER#2 <- %s: %s" % (addr[0], text.split("\r\n", 1)[0]))
         if "SIP/2.0 200" not in text:
             raise RuntimeError("REGISTER#2: %s" % text.split("\r\n", 1)[0])
+        m = re.search(r"Service-Route:\s*(\S+)", text)
+        service_route = m.group(1) if m else ""
+        # 默认 IMPU = P-Associated-URI 里第一个 sip:+ 形式（MO 短信用）
+        impu = ""
+        m = re.search(r"P-Associated-URI:\s*<sip:\+[^>]+>", text)
+        if m:
+            impu = m.group(0).split("<", 1)[1].rstrip(">")
         log(">>> IMS REGISTERED OK <<<")
-        return True, None
+        return True, None, service_route, impu
     finally:
         cli.close()
         srv.close()
@@ -378,7 +386,7 @@ def main():
                                    % (ue, pcscf)}, ensure_ascii=False))
         return 1
     try:
-        ok, err = register(pcscf, ue)
+        ok, err, _sr = register(pcscf, ue)
     except Exception as e:
         ok, err = False, str(e)
         log("注册失败: %s" % e)
