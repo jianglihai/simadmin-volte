@@ -138,7 +138,9 @@ export default function PhonePage() {
 
   const loadVolte = useCallback(async () => {
     try {
-      setVolte(await api.getVolteControl())
+      // request 返回 ApiResponse 包装，需解包 .data（VolteSettings 同款）
+      const res = await api.getVolteControl()
+      setVolte(res.data ?? null)
     } catch {
       // 电话页不因 VoLTE 状态获取失败而报错
     }
@@ -358,9 +360,9 @@ export default function PhonePage() {
         <Chip
           size="small"
           color={
-            volte?.runtime.phase === 'registered'
+            volte?.runtime?.phase === 'registered'
               ? 'success'
-              : volte?.runtime.phase === 'degraded'
+              : volte?.runtime?.phase === 'degraded'
                 ? 'warning'
                 : volte?.feature_enabled
                   ? 'info'
@@ -369,7 +371,7 @@ export default function PhonePage() {
           icon={<VpnKey />}
           label={`VoLTE ${
             volte
-              ? (VOLTE_PHASE_TEXT[volte.runtime.phase] ?? volte.runtime.phase)
+              ? (VOLTE_PHASE_TEXT[volte.runtime?.phase ?? ''] ?? volte.runtime?.phase ?? '未知')
               : '…'
           }`}
           onClick={() => setTabValue(0)}

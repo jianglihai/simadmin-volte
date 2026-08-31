@@ -18,6 +18,7 @@ import {
   SignalCellularAlt as SignalIcon,
   Settings as SettingsIcon,
   Sms as SmsIcon,
+  Phone as PhoneIcon,
   NotificationsActive as NotificationsIcon,
   GitHub as GitHubIcon,
   SystemUpdateAlt as OtaIcon,
@@ -62,7 +63,7 @@ const menuGroups: MenuConfigItem[] = [
   { type: 'direct', path: '/', label: '仪表盘', icon: DashboardIcon },
   { type: 'direct', path: '/sim', label: 'SIM 卡', icon: SimIcon },
   { type: 'direct', path: '/sms', label: '短信管理', icon: SmsIcon },
-  // { path: '/phone', label: '电话管理', icon: PhoneIcon },
+  { type: 'direct', path: '/phone', label: '电话管理', icon: PhoneIcon },
   {
     type: 'group',
     label: '网络',
