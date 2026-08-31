@@ -80,7 +80,7 @@ pub enum RpType {
 }
 
 impl RpType {
-    fn from_octet(o: u8) -> Option<Self> {
+    pub fn from_octet(o: u8) -> Option<Self> {
         Some(match o & 0x07 {
             0x00 => RpType::DataMs,
             0x01 => RpType::DataNetwork,

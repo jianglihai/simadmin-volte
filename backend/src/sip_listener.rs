@@ -11,7 +11,7 @@
 use crate::db::{beijing_sms_now_string, Database, SmsMessage};
 use crate::ims_sms::{
     decode_rp_data, decode_sms_deliver, duplicate_key, encode_rp_ack, MultipartCache,
-    MultipartOutcome,
+    MultipartOutcome, RpType,
 };
 use crate::notification::NotificationSender;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -164,6 +164,31 @@ async fn handle_packet(
             return Some(build_response(&head, None, "200 OK"));
         }
         return None;
+    }
+
+    // TS 24.341 §4.3.1：MTI 0x03 是 IP-SM-GW 对我们 MO 的 RP-ACK 投递确认，
+    // 不是 RP-DATA。网络把它作为独立 MESSAGE 送达，无需再回 RP-ACK；
+    // 若按 RP-DATA 硬解会稳定报 volte_sms_encode_failed 刷屏。
+    if let Some(mt) = RpType::from_octet(body.first().copied().unwrap_or(0)) {
+        match mt {
+            RpType::AckNetwork | RpType::AckMs => {
+                info!(
+                    target: "simadmin::volte",
+                    reference = body.get(1).copied().unwrap_or(0),
+                    "IMS MO RP-ACK received from network, MO delivery confirmed"
+                );
+                return None;
+            }
+            RpType::ErrorNetwork => {
+                warn!(
+                    target: "simadmin::volte",
+                    body_hex = %body.iter().take(16).map(|b| format!("{b:02x}")).collect::<String>(),
+                    "IMS MO RP-ERR received from network, MO delivery rejected"
+                );
+                return None;
+            }
+            _ => {}
+        }
     }
 
     let rp = match decode_rp_data(body) {
