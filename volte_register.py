@@ -386,7 +386,7 @@ def main():
                                    % (ue, pcscf)}, ensure_ascii=False))
         return 1
     try:
-        ok, err, _sr = register(pcscf, ue)
+        ok, err, _sr, _impu = register(pcscf, ue)
     except Exception as e:
         ok, err = False, str(e)
         log("注册失败: %s" % e)
