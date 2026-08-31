@@ -21,6 +21,7 @@ import {
   ListItemText,
   Paper,
   Snackbar,
+  Switch,
   Tab,
   Tabs,
   TextField,
@@ -45,8 +46,17 @@ import {
   VpnKey,
 } from '@mui/icons-material'
 import { type CallInfo, type CallRecord, type CallStats } from '../api/current'
+import { type VolteControl } from '../api/contracts'
 import { useSimAdminApi } from '../contexts/ApiContext'
 import VolteSettings from './VolteSettings'
+
+const VOLTE_PHASE_TEXT: Record<string, string> = {
+  disabled: '已关闭',
+  starting: '启动中',
+  registered: '已注册',
+  degraded: '重试中',
+  stopping: '停止中',
+}
 
 const dialpadButtons = [
   ['1', '2', '3'],
@@ -123,6 +133,34 @@ export default function PhonePage() {
   const [callStats, setCallStats] = useState<CallStats>(emptyStats)
   const [historyLoading, setHistoryLoading] = useState(false)
   const [clearDialogOpen, setClearDialogOpen] = useState(false)
+  const [volte, setVolte] = useState<VolteControl | null>(null)
+  const [volteBusy, setVolteBusy] = useState(false)
+
+  const loadVolte = useCallback(async () => {
+    try {
+      setVolte(await api.getVolteControl())
+    } catch {
+      // 电话页不因 VoLTE 状态获取失败而报错
+    }
+  }, [api])
+
+  useEffect(() => {
+    void loadVolte()
+    const timer = window.setInterval(() => void loadVolte(), 15000)
+    return () => window.clearInterval(timer)
+  }, [loadVolte])
+
+  const toggleVolte = async (on: boolean) => {
+    setVolteBusy(true)
+    try {
+      await api.setVolteFeature(on)
+      await loadVolte()
+    } catch {
+      // 状态轮询会反映真实结果
+    } finally {
+      setVolteBusy(false)
+    }
+  }
 
   const fetchCalls = useCallback(async () => {
     setCallsLoading(true)
@@ -311,15 +349,52 @@ export default function PhonePage() {
         </Paper>
       </Fade>
 
+      <Box
+        display="flex"
+        alignItems="center"
+        gap={1.5}
+        sx={{ mb: 1, flexWrap: 'wrap' }}
+      >
+        <Chip
+          size="small"
+          color={
+            volte?.runtime.phase === 'registered'
+              ? 'success'
+              : volte?.runtime.phase === 'degraded'
+                ? 'warning'
+                : volte?.feature_enabled
+                  ? 'info'
+                  : 'default'
+          }
+          icon={<VpnKey />}
+          label={`VoLTE ${
+            volte
+              ? (VOLTE_PHASE_TEXT[volte.runtime.phase] ?? volte.runtime.phase)
+              : '…'
+          }`}
+          onClick={() => setTabValue(0)}
+          sx={{ cursor: 'pointer' }}
+        />
+        <Switch
+          size="small"
+          checked={!!volte?.feature_enabled}
+          disabled={volteBusy}
+          onChange={(e) => void toggleVolte(e.target.checked)}
+        />
+        <Typography variant="caption" color="text.secondary">
+          点此开关启用/关闭 VoLTE，点状态查看详情
+        </Typography>
+      </Box>
+
       <Tabs value={tabValue} onChange={(_, value: number) => setTabValue(value)} sx={{ mb: 2 }}>
+        <Tab icon={<VpnKey />} label="VoLTE" iconPosition="start" />
         <Tab icon={<Dialpad />} label="拨号" iconPosition="start" />
         <Tab icon={<History />} label="通话记录" iconPosition="start" />
-        <Tab icon={<VpnKey />} label="VoLTE" iconPosition="start" />
       </Tabs>
 
-      {tabValue === 2 && <VolteSettings />}
+      {tabValue === 0 && <VolteSettings />}
 
-      {tabValue === 0 && (
+      {tabValue === 1 && (
         <Card>
           <CardContent>
             <Box display="flex" flexDirection="column" alignItems="center" maxWidth={320} mx="auto">
@@ -373,7 +448,7 @@ export default function PhonePage() {
         </Card>
       )}
 
-      {tabValue === 1 && (
+      {tabValue === 2 && (
         <Card>
           <CardContent>
             <Box display="flex" gap={2} mb={2} flexWrap="wrap">

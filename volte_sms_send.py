@@ -121,13 +121,17 @@ def md5h(b):
 
 
 def send_message(pcscf, ue, recipient, text, service_route, impu):
-    # 用户部分保留 "+"（E.164），vendor 探针同款
-    phone_user = "+" + "".join(ch for ch in recipient if ch.isdigit())
+    # E.164 号码保留 "+"；短号（10010 等）不加前缀
+    digits = "".join(ch for ch in recipient if ch.isdigit())
+    international = recipient.strip().startswith("+")
+    phone_user = ("+" + digits) if international else digits
     to_uri = "sip:%s@%s;user=phone" % (phone_user, DOMAIN)
+    # TPDU 目标地址同样区分长短号
+    tpdu_recipient = recipient if international else digits
     # TS 24.341：MO MESSAGE 的 Request-URI = SMSC / IP-SM-GW 身份（非收件人）
     smsc_user = "+" + "".join(ch for ch in SMSC if ch.isdigit())
     request_uri = "sip:%s@%s;user=phone" % (smsc_user, DOMAIN)
-    mr, body = build_mo_sms_body(recipient, text, SMSC)
+    mr, body = build_mo_sms_body(tpdu_recipient, text, SMSC)
     callid = md5h(str(time.time()).encode())[:24] + "@simadmin-volte"
     branch = "branch=z9hG4bK" + md5h((callid + "msg").encode())
     routes = ["<sip:[%s]:5060;lr>" % pcscf]
