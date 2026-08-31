@@ -2996,31 +2996,89 @@ pub async fn send_sms_handler(
     State(db): State<Arc<Database>>,
     Json(payload): Json<SendSmsRequest>,
 ) -> impl IntoResponse {
-    match send_sms(&conn, &payload.phone_number, &payload.content).await {
-        Ok(path) => {
-            // 存入数据库
-            let _ = db.insert_sms(
-                "outgoing",
-                &payload.phone_number,
-                &payload.content,
-                "sent",
-                None,
-            );
-            (
-                StatusCode::OK,
-                Json(ApiResponse::success_with_message(
-                    "SMS sent",
-                    json!({ "path": path }),
-                )),
-            )
+    let phone = &payload.phone_number;
+    let content = &payload.content;
+
+    // 先试 CS 域（ModemManager）。IMS 接管后 CS 域常常失效，所以走不了就
+    // 用 beta9 的 volte_sms_send.py 经 SIP MESSAGE / IPsec 发（已真机实证
+    // 202 Accept，且脚本内部会自动重注册拿 IMPU + Service-Route）。
+    let path = match send_sms(&conn, phone, content).await {
+        Ok(p) => p,
+        Err(cs_err) => {
+            warn!(error = %cs_err, "CS-domain SMS failed, falling back to IMS MESSAGE");
+            if let Some(ims_path) = ims_send_sms(phone, content).await {
+                ims_path
+            } else {
+                return (
+                    StatusCode::OK,
+                    Json(ApiResponse::<serde_json::Value>::error(format!(
+                        "Failed to send SMS (CS: {} / IMS unavailable)",
+                        cs_err
+                    ))),
+                );
+            }
         }
-        Err(e) => (
-            StatusCode::OK,
-            Json(ApiResponse::<serde_json::Value>::error(format!(
-                "Failed to send SMS: {}",
-                e
-            ))),
-        ),
+    };
+    let _ = db.insert_sms(
+        "outgoing",
+        phone,
+        content,
+        "sent",
+        None,
+    );
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "SMS sent",
+            json!({ "path": path }),
+        )),
+    )
+}
+
+/// 走 IMS：复用 beta9 的 volte_sms_send.py（内部自动重注册 + SIP MESSAGE）。
+async fn ims_send_sms(phone: &str, content: &str) -> Option<String> {
+    let script = "/opt/simadmin/volte_sms_send.py";
+    let out: Output = match tokio::process::Command::new("python3")
+        .args(["-u", script, content, phone])
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            warn!(error = %e, "IMS SMS: could not spawn volte_sms_send.py");
+            return None;
+        }
+    };
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        warn!(stderr = %err, "IMS SMS: volte_sms_send.py failed");
+        return None;
+    }
+    // 脚本最后一行是 JSON: {"sent": bool, "status": "...", ...}
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut json_line = None;
+    for line in stdout.lines().rev() {
+        let t = line.trim();
+        if t.starts_with('{') && t.ends_with('}') {
+            json_line = Some(t);
+            break;
+        }
+    }
+    let line = json_line?;
+    let v: serde_json::Value = match serde_json::from_str(line) {
+        Ok(j) => j,
+        Err(e) => {
+            warn!(error = %e, "IMS SMS: JSON parse failed");
+            return None;
+        }
+    };
+    if v.get("sent").and_then(|x| x.as_bool()) == Some(true) {
+        info!(phone = %phone, "IMS SMS sent via MESSAGE");
+        Some(format!("ims:{phone}"))
+    } else {
+        let err = v.get("error").and_then(|x| x.as_str()).unwrap_or("IMS: not sent");
+        warn!(error = %err, "IMS SMS not confirmed");
+        None
     }
 }
 
