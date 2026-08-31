@@ -3008,23 +3008,34 @@ pub async fn send_sms_handler(
         send_sms(&conn, phone, content),
     )
     .await;
-    let path = match cs_res {
+    let path: String = match cs_res {
         Ok(Ok(p)) => p,
-        Ok(Err(cs_err)) | Err(_) => {
-            if matches!(cs_res, Err(_)) {
-                warn!("CS-domain SMS zbus timed out, falling back to IMS MESSAGE");
-            } else {
-                warn!(error = %cs_err, "CS-domain SMS failed, falling back to IMS MESSAGE");
+        Ok(Err(e)) => {
+            warn!(error = %e, "CS-domain SMS failed, falling back to IMS MESSAGE");
+            match ims_send_sms(phone, content).await {
+                Some(ims_path) => ims_path,
+                None => {
+                    return (
+                        StatusCode::OK,
+                        Json(ApiResponse::<serde_json::Value>::error(
+                            "Failed to send SMS (CS failed / IMS unavailable)".to_string(),
+                        )),
+                    );
+                }
             }
-            if let Some(ims_path) = ims_send_sms(phone, content).await {
-                ims_path
-            } else {
-                return (
-                    StatusCode::OK,
-                    Json(ApiResponse::<serde_json::Value>::error(
-                        "Failed to send SMS (CS failed / IMS unavailable)".to_string(),
-                    )),
-                );
+        }
+        Err(_) => {
+            warn!("CS-domain SMS zbus timed out, falling back to IMS MESSAGE");
+            match ims_send_sms(phone, content).await {
+                Some(ims_path) => ims_path,
+                None => {
+                    return (
+                        StatusCode::OK,
+                        Json(ApiResponse::<serde_json::Value>::error(
+                            "Failed to send SMS (CS failed / IMS unavailable)".to_string(),
+                        )),
+                    );
+                }
             }
         }
     };
