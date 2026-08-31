@@ -3037,15 +3037,24 @@ pub async fn send_sms_handler(
 
 /// 走 IMS：复用 beta9 的 volte_sms_send.py（内部自动重注册 + SIP MESSAGE）。
 async fn ims_send_sms(phone: &str, content: &str) -> Option<String> {
+    use std::time::Duration;
+
     let script = "/opt/simadmin/volte_sms_send.py";
-    let out: Output = match tokio::process::Command::new("python3")
-        .args(["-u", script, content, phone])
-        .output()
-        .await
+    let out: Output = match tokio::time::timeout(
+        Duration::from_secs(120),
+        tokio::process::Command::new("python3")
+            .args(["-u", script, content, phone])
+            .output(),
+    )
+    .await
     {
-        Ok(o) => o,
-        Err(e) => {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
             warn!(error = %e, "IMS SMS: could not spawn volte_sms_send.py");
+            return None;
+        }
+        Err(_) => {
+            warn!("IMS SMS: volte_sms_send.py timed out");
             return None;
         }
     };
