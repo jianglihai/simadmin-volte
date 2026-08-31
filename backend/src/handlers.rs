@@ -2999,22 +2999,30 @@ pub async fn send_sms_handler(
     let phone = &payload.phone_number;
     let content = &payload.content;
 
-    // 先试 CS 域（ModemManager）。IMS 接管后 CS 域常常失效，所以走不了就
-    // 用 beta9 的 volte_sms_send.py 经 SIP MESSAGE / IPsec 发（已真机实证
-    // 202 Accept，且脚本内部会自动重注册拿 IMPU + Service-Route）。
-    let path = match send_sms(&conn, phone, content).await {
-        Ok(p) => p,
-        Err(cs_err) => {
-            warn!(error = %cs_err, "CS-domain SMS failed, falling back to IMS MESSAGE");
+    // 先试 CS 域（ModemManager），但包个短超时：zbus 调用没有超时、且会持有
+    // with_serial 锁，挂死会把 HTTP handler 拖到超时、使下面的 IMS 兜底永远
+    // 走不到。IMS 接管后 CS 域也常常本就失效，所以走不了就切 IMS MESSAGE。
+    let cs_res = tokio::time::timeout(
+        std::time::Duration::from_secs(25),
+        send_sms(&conn, phone, content),
+    )
+    .await;
+    let path = match cs_res {
+        Ok(Ok(p)) => p,
+        Ok(Err(cs_err)) | Err(_) => {
+            if matches!(cs_res, Err(_)) {
+                warn!("CS-domain SMS timed out, falling back to IMS MESSAGE");
+            } else {
+                warn!(error = %cs_err, "CS-domain SMS failed, falling back to IMS MESSAGE");
+            }
             if let Some(ims_path) = ims_send_sms(phone, content).await {
                 ims_path
             } else {
                 return (
                     StatusCode::OK,
-                    Json(ApiResponse::<serde_json::Value>::error(format!(
-                        "Failed to send SMS (CS: {} / IMS unavailable)",
-                        cs_err
-                    ))),
+                    Json(ApiResponse::<serde_json::Value>::error(
+                        "Failed to send SMS (CS failed / IMS unavailable)".to_string(),
+                    )),
                 );
             }
         }
