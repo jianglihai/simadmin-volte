@@ -3004,7 +3004,7 @@ pub async fn send_sms_handler(
     // future 被 drop，其内部的 tokio::sync::Mutex guard 随之析构释放锁，
     // 下面的 IMS 兜底立即可重新拿锁，不会被卡住。
     let cs_res = tokio::time::timeout(
-        std::time::Duration::from_secs(25),
+        std::time::Duration::from_secs(3),
         send_sms(&conn, phone, content),
     )
     .await;
