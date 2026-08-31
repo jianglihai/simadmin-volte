@@ -2999,9 +2999,10 @@ pub async fn send_sms_handler(
     let phone = &payload.phone_number;
     let content = &payload.content;
 
-    // 先试 CS 域（ModemManager），但包个短超时：zbus 调用没有超时、且会持有
-    // with_serial 锁，挂死会把 HTTP handler 拖到超时、使下面的 IMS 兜底永远
-    // 走不到。IMS 接管后 CS 域也常常本就失效，所以走不了就切 IMS MESSAGE。
+    // 先试 CS 域（ModemManager）。zbus 调用本身没有超时、且持有 with_serial
+    // 锁，会挂死拖垮 HTTP handler。直接对这个 future 做 timeout：超时后
+    // future 被 drop，其内部的 tokio::sync::Mutex guard 随之析构释放锁，
+    // 下面的 IMS 兜底立即可重新拿锁，不会被卡住。
     let cs_res = tokio::time::timeout(
         std::time::Duration::from_secs(25),
         send_sms(&conn, phone, content),
@@ -3011,7 +3012,7 @@ pub async fn send_sms_handler(
         Ok(Ok(p)) => p,
         Ok(Err(cs_err)) | Err(_) => {
             if matches!(cs_res, Err(_)) {
-                warn!("CS-domain SMS timed out, falling back to IMS MESSAGE");
+                warn!("CS-domain SMS zbus timed out, falling back to IMS MESSAGE");
             } else {
                 warn!(error = %cs_err, "CS-domain SMS failed, falling back to IMS MESSAGE");
             }
