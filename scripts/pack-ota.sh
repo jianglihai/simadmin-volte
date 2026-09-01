@@ -46,14 +46,14 @@ echo "  打包 OTA 更新包"
 echo "=========================================="
 echo ""
 
-# 读取版本号
+# 读取版本号（文件优先，否则用 workflow env，最后 fallback）
 VERSION_FILE="VERSION"
 if [ -f "$VERSION_FILE" ]; then
-    VERSION=$(cat "$VERSION_FILE" | tr -d '[:space:]')
-else
-    echo "❌ 错误: VERSION 文件不存在"
-    exit 1
+    _VF=$(tr -d '[:space:]' < "$VERSION_FILE")
+    [ -n "$_VF" ] && VERSION="$_VF"
 fi
+VERSION="${VERSION:-1.1.12}"
+echo "📍 版本号: $VERSION"
 
 # 获取 Git commit
 if command -v git &> /dev/null && [ -d ".git" ]; then
@@ -169,21 +169,29 @@ echo ""
 # 创建输出目录
 mkdir -p release
 
-# 打包：先用 --no-recursion 列文件，再单独递归打 www，避免 GNU tar 混合目录时偶发失败
+# 输出包名（防御空变量，避免输出路径等于目录）
+: "${VERSION:?VERSION 为空}"
+: "${TARGET:?TARGET 为空}"
+OTA_FILE="release/simadmin_${VERSION}_${TARGET}.tar.gz"
+OTA_OUT="$PROJ_ROOT/$OTA_FILE"
+echo "📍 输出: $OTA_FILE"
+
+# 打包：用 tar -C 切换归档根，全程不 cd，输出用绝对路径
+# 显式文件列表 + 用 -C 加 www 目录，最干净地避免 GNU tar 目录参数歧义
 echo "📦 打包 OTA 更新包..."
-# 用纯文件列表，不把 www 目录本身当参数，避免 GNU tar 对目录参数报错
-OTA_MANIFEST=(meta.json simadmin volte_register.py volte_sms_send.py qmi.py simadmin.service)
-cd "$OTA_TMP"
-for _f in "${OTA_MANIFEST[@]}"; do
-  [ -e "$_f" ] || die "❌ 打包缺失资产: $_f"
-done
-[ -e simadmin-modem-recovery.service ] && OTA_MANIFEST+=(simadmin-modem-recovery.service)
-[ -d www ] || die "❌ 打包缺失资产: www"
-# 把 www 展开为显式文件列表
-_www_files=()
-while IFS= read -r _w; do _www_files+=("$_w"); done < <(find www -type f | sort)
-tar -czf "$PROJ_ROOT/$OTA_FILE" "${OTA_MANIFEST[@]}" "${_www_files[@]}"
-cd "$PROJ_ROOT"
+[ -e "$OTA_TMP/meta.json" ] && [ -e "$OTA_TMP/simadmin" ] \
+  && [ -d "$OTA_TMP/www" ] \
+  || die "❌ 打包准备失败: 资产不完整"
+tar -czf "$OTA_OUT" \
+  -C "$OTA_TMP" meta.json simadmin \
+  $(test -e "$OTA_TMP/volte_register.py" && echo volte_register.py) \
+  $(test -e "$OTA_TMP/volte_sms_send.py" && echo volte_sms_send.py) \
+  $(test -e "$OTA_TMP/qmi.py" && echo qmi.py) \
+  $(test -e "$OTA_TMP/simadmin.service" && echo simadmin.service) \
+  $(test -e "$OTA_TMP/simadmin-modem-recovery.service" && echo simadmin-modem-recovery.service) \
+  -C "$OTA_TMP" www
+[ -f "$OTA_OUT" ] || die "❌ tar 未生成输出: $OTA_OUT"
+[ -s "$OTA_OUT" ] || die "❌ 输出文件为空: $OTA_OUT"
 
 # 显示结果
 echo ""
