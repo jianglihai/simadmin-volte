@@ -2,7 +2,7 @@
 
 set -eu
 
-REPO="${REPO:-3899/SimAdmin}"
+REPO="${REPO:-jianglihai/simadmin-volte}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/simadmin}"
 SERVICE_NAME="${SERVICE_NAME:-simadmin}"
 VERSION="${VERSION:-latest}"
@@ -25,7 +25,9 @@ SIMADMIN_LPAC_ONLY="${SIMADMIN_LPAC_ONLY:-0}"
 LPAC_REPO="${LPAC_REPO:-estkme-group/lpac}"
 LPAC_RELEASE_BASE_URL="${LPAC_RELEASE_BASE_URL:-https://github.com/${LPAC_REPO}/releases/latest/download}"
 LPAC_LATEST_RELEASE_URL="${LPAC_LATEST_RELEASE_URL:-https://github.com/${LPAC_REPO}/releases/latest}"
-LPAC_COMPAT_RELEASE_BASE_URL="${LPAC_COMPAT_RELEASE_BASE_URL:-https://github.com/${REPO}/releases/download/lpac}"
+# lpac 兼容包仅托管在上游 3899/SimAdmin 的 lpac 发布标签下，与 SimAdmin 主资源仓库解耦
+LPAC_COMPAT_REPO="${LPAC_COMPAT_REPO:-3899/SimAdmin}"
+LPAC_COMPAT_RELEASE_BASE_URL="${LPAC_COMPAT_RELEASE_BASE_URL:-https://github.com/${LPAC_COMPAT_REPO}/releases/download/lpac}"
 LPAC_COMPAT_MANIFEST_NAME="${LPAC_COMPAT_MANIFEST_NAME:-lpac.json}"
 LPAC_TARGET_ARCH="${LPAC_TARGET_ARCH:-}"
 LPAC_TARGET_VERSION="${LPAC_TARGET_VERSION:-}"
@@ -1131,6 +1133,14 @@ main() {
   echo "    version: ${VERSION}"
   echo "    install dir: ${INSTALL_DIR}"
   echo "    service name: ${SERVICE_NAME}"
+
+  if truthy "$WFC" || [ "$VARIANT" = "wfc" ]; then
+    case "$REPO" in
+      jianglihai/simadmin-volte)
+        echo "warning: ${REPO} 未提供 wfc 变体资源；需要 Wi-Fi Calling 请改用 REPO=3899/SimAdmin" >&2
+        ;;
+    esac
+  fi
 
   install_system_dependencies
   require_cmd curl
