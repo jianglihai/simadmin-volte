@@ -169,15 +169,20 @@ echo ""
 # 创建输出目录
 mkdir -p release
 
-# 打包：显式列出全部资产，缺一个就报错，避免再次"漏包"
+# 打包：先用 --no-recursion 列文件，再单独递归打 www，避免 GNU tar 混合目录时偶发失败
 echo "📦 打包 OTA 更新包..."
-OTA_MANIFEST=(meta.json simadmin www volte_register.py volte_sms_send.py qmi.py simadmin.service)
+# 用纯文件列表，不把 www 目录本身当参数，避免 GNU tar 对目录参数报错
+OTA_MANIFEST=(meta.json simadmin volte_register.py volte_sms_send.py qmi.py simadmin.service)
 cd "$OTA_TMP"
 for _f in "${OTA_MANIFEST[@]}"; do
   [ -e "$_f" ] || die "❌ 打包缺失资产: $_f"
 done
 [ -e simadmin-modem-recovery.service ] && OTA_MANIFEST+=(simadmin-modem-recovery.service)
-tar -czf "$PROJ_ROOT/$OTA_FILE" "${OTA_MANIFEST[@]}"
+[ -d www ] || die "❌ 打包缺失资产: www"
+# 把 www 展开为显式文件列表
+_www_files=()
+while IFS= read -r _w; do _www_files+=("$_w"); done < <(find www -type f | sort)
+tar -czf "$PROJ_ROOT/$OTA_FILE" "${OTA_MANIFEST[@]}" "${_www_files[@]}"
 cd "$PROJ_ROOT"
 
 # 显示结果
