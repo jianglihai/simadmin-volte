@@ -90,10 +90,29 @@ echo "📝 Commit: $COMMIT"
 echo "🕐 构建时间: $BUILD_TIME"
 echo ""
 
+# 复制 SimAdmin systemd 服务单元，OTA 一并带出，部署时安装到系统
+echo "📋 复制 systemd 服务单元..."
+for _UNIT in scripts/simadmin.service scripts/simadmin-modem-recovery.service; do
+  if [ -f "$_UNIT" ]; then
+    cp "$_UNIT" "$OTA_TMP/$(basename "$_UNIT")"
+  fi
+done
 # 复制后端二进制
 echo "📋 复制后端二进制..."
 cp "$BINARY_PATH" "$OTA_TMP/simadmin"
 chmod 755 "$OTA_TMP/simadmin"
+
+# 复制 VoLTE Python 脚本（注册 / 发送 / QMI 封装），设备运行时动态调用
+# 这些脚本必须随 OTA 一并部署，否则 IMS 注册/发送直接 No such file。
+echo "📋 复制 VoLTE Python 脚本..."
+for _PY in volte_register.py volte_sms_send.py qmi.py; do
+  if [ -f "$_PY" ]; then
+    cp "$_PY" "$OTA_TMP/$_PY"
+    chmod 755 "$OTA_TMP/$_PY"
+  else
+    echo "⚠  脚本缺失: $_PY（将跳过）" >&2
+  fi
+done
 
 # 计算二进制 MD5
 if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -147,11 +166,15 @@ echo ""
 # 创建输出目录
 mkdir -p release
 
-# 打包
-OTA_FILE="release/simadmin_${VERSION}_${TARGET}.tar.gz"
+# 打包：显式列出全部资产，缺一个就报错，避免再次"漏包"
 echo "📦 打包 OTA 更新包..."
+OTA_MANIFEST=(meta.json simadmin www volte_register.py volte_sms_send.py qmi.py simadmin.service)
 cd "$OTA_TMP"
-tar -czf - meta.json simadmin www > "$OLDPWD/$OTA_FILE"
+for _f in "${OTA_MANIFEST[@]}"; do
+  [ -e "$_f" ] || die "❌ 打包缺失资产: $_f"
+done
+[ -e simadmin-modem-recovery.service ] && OTA_MANIFEST+=(simadmin-modem-recovery.service)
+tar -czf - "${OTA_MANIFEST[@]}" > "$OLDPWD/$OTA_FILE"
 cd "$OLDPWD"
 
 # 显示结果
