@@ -5,6 +5,9 @@
 
 set -e
 
+# 记录调用者所在目录（脚本自身会 cd 到项目根，用这个保持输出路径正确）
+OUT_DIR="$(pwd)"
+
 # 切换到项目根目录
 cd "$(dirname "$0")/.."
 
@@ -174,8 +177,9 @@ for _f in "${OTA_MANIFEST[@]}"; do
   [ -e "$_f" ] || die "❌ 打包缺失资产: $_f"
 done
 [ -e simadmin-modem-recovery.service ] && OTA_MANIFEST+=(simadmin-modem-recovery.service)
-tar -czf - "${OTA_MANIFEST[@]}" > "$OLDPWD/$OTA_FILE"
-cd "$OLDPWD"
+tar -czf "${OUT_DIR}/_pack_tmp.tar.gz" "${OTA_MANIFEST[@]}"
+mv "${OUT_DIR}/_pack_tmp.tar.gz" "$OUT_DIR/$OTA_FILE"
+cd "$OUT_DIR"
 
 # 显示结果
 echo ""
