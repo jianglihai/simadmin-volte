@@ -283,6 +283,8 @@ jobs:
           files: |
             release/simadmin-aarch64.tar.gz
             release/simadmin-x86_64.tar.gz
+            deploy.sh
+            install.sh
           body_path: release/RELEASE_BODY.md
           overwrite_files: true
           generate_release_notes: false

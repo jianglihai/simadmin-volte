@@ -11,3 +11,8 @@
 *.db binary
 *.sqlite binary
 *.sqlite3 binary
+
+# VoLTE: 脚本一律 LF（设备上 curl|bash / python 直跑不能带 CRLF）
+*.sh text eol=lf
+*.py text eol=lf
+*.rs text eol=lf

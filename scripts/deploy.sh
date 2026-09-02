@@ -1,55 +1,66 @@
 #!/usr/bin/env bash
 # ============================================================
-# 一键部署：从 GitHub 拉取最新 release 包并部署 SimAdmin-volte
+# 一键部署：从 GitHub 拉取最新 release 包并部署 SimAdmin-VoLTE
 #
-# 用法（设备上直接运行，需要 WiFi 出网下载 GitHub）：
+# 用法（设备上直接运行，需要出网访问 GitHub）：
 #   curl -fsSL https://github.com/jianglihai/simadmin-volte/releases/download/v1.1.12/deploy.sh | bash
 #
 # 或本地已有脚本：
 #   bash deploy.sh
 #   bash deploy.sh v1.1.12        # 指定版本
-#   bash deploy.sh <github_url>    # 直接给 tar.gz 下载链接
+#   bash deploy.sh <github_url>   # 直接给 tar.gz 下载链接
 #
-# 环境要求：bash、curl、tar、systemctl、md5sum、strings/grep
-# 作者：Hermes Agent
+# 部署内容 = OTA 包全量文件：simadmin + www/ + meta.json
+#            + volte_register.py / volte_sms_send.py / qmi.py
+#            + simadmin.service / simadmin-modem-recovery.service
+# 全量备份 + 全量回滚；支持全新设备（无旧部署）直接安装。
+# 环境要求：bash、curl、tar、systemctl、md5sum
 # ============================================================
 set -euo pipefail
 
 OWNER=jianglihai
 REPO=simadmin-volte
 DEFAULT_TAG=v1.1.12
-BACKUP_ROOT=/opt
-BINARY_PATH=/opt/simadmin/simadmin
+INSTALL_DIR=/opt/simadmin
+BINARY_PATH="$INSTALL_DIR/simadmin"
+SERVICE_NAME=simadmin
+UNIT_DIR=/etc/systemd/system
 OTA_DIR=/tmp/simadmin-ota-$$
 
 log()  { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 die()  { printf '\n[ERROR] %s\n' "$*" >&2; exit 1; }
 
 TAG="${1:-$DEFAULT_TAG}"
-if [[ "$TAG" == http* ]]; then DOWNLOAD_URL="$TAG"; else
+if [[ "$TAG" == http* ]]; then
+  DOWNLOAD_URL="$TAG"
+else
   DOWNLOAD_URL="https://github.com/$OWNER/$REPO/releases/download/$TAG/simadmin-aarch64.tar.gz"
 fi
 log "release 版本: $TAG"
 log "下载: $DOWNLOAD_URL"
 
 # 1) 系统前置检查 ------------------------------------------------
-command -v curl >/dev/null || die "缺少 curl"
-command -v tar  >/dev/null || die "缺少 tar"
+command -v curl >/dev/null      || die "缺少 curl"
+command -v tar >/dev/null       || die "缺少 tar"
 command -v systemctl >/dev/null || die "缺少 systemctl（此设备不跑 systemd？）"
-command -v md5sum >/dev/null || die "缺少 md5sum"
-[[ "$(uname -m)" == "aarch64" ]] || die "本脚本只提供 aarch64 包；当前架构: $(uname -m)"
-[[ -f "$BINARY_PATH" ]] || die "未找到旧二进制 $BINARY_PATH（服务未部署？）"
+command -v md5sum >/dev/null    || die "缺少 md5sum"
+[[ "$(uname -m)" == "aarch64" ]] || die "当前只有 aarch64 包；本机架构: $(uname -m)"
 
+if [[ -f "$BINARY_PATH" ]]; then
+  log "检测到已有部署: $BINARY_PATH (md5: $(md5sum "$BINARY_PATH" | awk '{print $1}'))"
+else
+  log "未检测到旧部署，将执行全新安装（systemd 单元 + /opt/simadmin 全量）"
+fi
 log "磁盘: $(df -h / | tail -1)"
 
 # 2) 下载 --------------------------------------------------------
-cd "$OTA_DIR"
 mkdir -p "$OTA_DIR"
+cd "$OTA_DIR"
 curl -fsSL --retry 3 -o simadmin-aarch64.tar.gz "$DOWNLOAD_URL" \
   || die "下载失败（检查网络 / release 是否存在）"
 log "下载完成: $(ls -la simadmin-aarch64.tar.gz | awk '{print $5, $9}')"
 
-# 3) 校验 md5：包内 meta.json 的 binary_md5 必须等于解压出的二进制 md5 ----
+# 3) 完整性校验：meta.json 的 binary_md5 必须与包内二进制一致 ------
 meta=$(tar xzf simadmin-aarch64.tar.gz -O meta.json) || die "包内无 meta.json"
 log "meta.json: $meta"
 meta_bin_md5=$(printf '%s' "$meta" | grep -o '"binary_md5": *"[0-9a-f]\{32\}"' | head -1 | grep -o '[0-9a-f]\{32\}')
@@ -62,66 +73,78 @@ if [[ "$meta_bin_md5" != "$real_md5" ]]; then
 fi
 log "md5 校验通过: $meta_bin_md5 (commit: $meta_commit)"
 
-# 4) 备份 --------------------------------------------------------
+# 4) 全量备份（二进制 + www + 脚本 + 单元 + meta）-----------------
 backup_ts=$(date +%Y%m%d_%H%M%S)
-BACKUP_DIR="$BACKUP_ROOT/simadmin-backup-${backup_ts}"
+BACKUP_DIR="$INSTALL_DIR-backup-${backup_ts}"
 mkdir -p "$BACKUP_DIR"
-cp -a "$BINARY_PATH" "$BACKUP_DIR/"
-log "旧二进制已备份 -> $BACKUP_DIR/simadmin (md5: $(md5sum "$BINARY_PATH" | awk '{print $1}'))"
+for item in simadmin www meta.json volte_register.py volte_sms_send.py qmi.py \
+            "$UNIT_DIR/simadmin.service" "$UNIT_DIR/simadmin-modem-recovery.service" \
+            "$INSTALL_DIR/simadmin.service" "$INSTALL_DIR/simadmin-modem-recovery.service"; do
+  [[ -e "$item" ]] && cp -a "$item" "$BACKUP_DIR/" 2>/dev/null || true
+done
+log "全量备份 -> $BACKUP_DIR"
 
-# 5) 部署 --------------------------------------------------------
-tar xzf simadmin-aarch64.tar.gz -C /opt/simadmin/ --no-same-owner
+# 5) 部署（全量文件落位）------------------------------------------
+tar xzf simadmin-aarch64.tar.gz -C "$INSTALL_DIR/" --no-same-owner
 chmod 755 "$BINARY_PATH"
-log "部署完成: $(md5sum "$BINARY_PATH" | awk '{print $1}')"
-
-# 5b) 部署 VoLTE Python 脚本（注册 / 发送 / QMI），转 unix 行尾
+# git 检出/下载路径可能带入 CRLF，python 脚本必须转 unix 行尾
 for _PY in volte_register.py volte_sms_send.py qmi.py; do
-  if tar tf simadmin-aarch64.tar.gz 2>/dev/null | grep -qx "$_PY"; then
-    sed -i 's/\r$//' "/opt/simadmin/$_PY"
-    chmod 755 "/opt/simadmin/$_PY"
-    log "部署脚本: /opt/simadmin/$_PY ($(wc -l < "/opt/simadmin/$_PY") 行)"
-  else
-    log "⚠  包内无 $_PY，跳过（脚本版本较早可接受）"
+  if [[ -f "$INSTALL_DIR/$_PY" ]]; then
+    sed -i 's/\r$//' "$INSTALL_DIR/$_PY"
+    chmod 755 "$INSTALL_DIR/$_PY"
   fi
 done
 
-# 5c) 安装 systemd 服务单元（若包内包含）
-if tar tf simadmin-aarch64.tar.gz 2>/dev/null | grep -qx "simadmin.service"; then
-  cp /opt/simadmin/simadmin.service /etc/systemd/system/simadmin.service
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  log "systemd 单元已安装: /etc/systemd/system/simadmin.service"
+# 6) 安装 systemd 单元（全新设备必需）-----------------------------
+installed_unit=0
+for _UNIT in simadmin.service simadmin-modem-recovery.service; do
+  if [[ -f "$INSTALL_DIR/$_UNIT" ]]; then
+    if [[ ! -f "$UNIT_DIR/$_UNIT" ]] || ! cmp -s "$INSTALL_DIR/$_UNIT" "$UNIT_DIR/$_UNIT"; then
+      cp -f "$INSTALL_DIR/$_UNIT" "$UNIT_DIR/$_UNIT"
+      installed_unit=1
+      log "systemd 单元已安装: $UNIT_DIR/$_UNIT"
+    fi
+  fi
+done
+if [[ $installed_unit -eq 1 ]]; then
+  systemctl daemon-reload
 fi
-if tar tf simadmin-aarch64.tar.gz 2>/dev/null | grep -qx "simadmin-modem-recovery.service"; then
-  cp /opt/simadmin/simadmin-modem-recovery.service /etc/systemd/system/simadmin-modem-recovery.service
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  log "systemd 单元已安装: /etc/systemd/system/simadmin-modem-recovery.service"
-fi
+systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
 
-# 6) 重启 + 等待健康 --------------------------------------------
-systemctl restart simadmin >/dev/null 2>&1 || true
+# 7) 部署完整性自检 ------------------------------------------------
+missing=""
+for f in simadmin meta.json volte_register.py volte_sms_send.py qmi.py; do
+  [[ -f "$INSTALL_DIR/$f" ]] || missing="$missing $f"
+done
+[[ -d "$INSTALL_DIR/www" ]] || missing="$missing www/"
+[[ -z "$missing" ]] || die "部署不完整，缺少:$missing （备份在 $BACKUP_DIR，可回滚）"
+log "部署完整性 OK: $(md5sum "$BINARY_PATH" | awk '{print $1}')"
+
+# 8) 重启 + 等待健康 ----------------------------------------------
+systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
 log "等待服务就绪..."
+ready=0
 for i in $(seq 1 12); do
   if curl -sf "http://127.0.0.1:3000/api/health" >/dev/null 2>&1; then
-    log "服务就绪 (第 ${i} 秒)"
+    log "服务就绪 (第 ${i} 次探测)"
+    ready=1
     break
   fi
-  [[ $i -eq 12 ]] && die "服务未在 30s 内就绪，请查看: journalctl -u simadmin -n 40"
   sleep 2.5
 done
+[[ $ready -eq 1 ]] || die "服务未就绪，查看: journalctl -u $SERVICE_NAME -n 40"
 
-# 7) 冒烟测试：页面发送接口（发一条空内容探测，只看接口是否活着）----------
+# 9) 冒烟测试 ------------------------------------------------------
 code=$(curl -s -m 12 -o /dev/null -w "%{http_code}" "http://127.0.0.1:3000/api/sms/list?limit=1" 2>/dev/null || echo 000)
 if [[ "$code" == "200" ]]; then
   log "健康检查通过 (GET /api/sms/list = 200)"
 else
-  log "⚠ 接口异常 (HTTP $code)，请看日志: journalctl -u simadmin -n 60"
+  log "⚠ 接口异常 (HTTP $code)，请看日志: journalctl -u $SERVICE_NAME -n 60"
 fi
 
-log "版本: $(cat /opt/simadmin/simadmin* 2>/dev/null >/dev/null; "$BINARY_PATH" --version 2>/dev/null || echo 1.1.12)"
 log "=== 部署完成 ==="
-log "  新版本 md5 : $real_md5  commit: $meta_commit"
-log "  回滚命令   : cp $BACKUP_DIR/simadmin $BINARY_PATH && systemctl restart simadmin"
-log "  回滚备份   : $BACKUP_DIR"
+log "  版本      : $meta_commit (binary md5 $real_md5)"
+log "  全量备份  : $BACKUP_DIR"
+log "  全量回滚  : systemctl stop $SERVICE_NAME; cp -a $BACKUP_DIR/* $INSTALL_DIR/ 2>/dev/null; [[ -f $BACKUP_DIR/simadmin.service ]] && cp $BACKUP_DIR/simadmin.service $UNIT_DIR/; systemctl daemon-reload && systemctl restart $SERVICE_NAME"
 
-# 清理临时目录
 rm -rf "$OTA_DIR"

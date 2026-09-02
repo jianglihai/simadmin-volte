@@ -250,6 +250,34 @@ SimAdmin 是一套面向 Debian 蜂窝 CPE、随身 WiFi、软路由类设备的
 </a>
 
 
+
+
+---
+
+## 📞 VoLTE / IMS 增量版（本 Fork）
+
+本仓库 = 官方 [3899/SimAdmin](https://github.com/3899/SimAdmin) 完整源码 +
+VoLTE/IMS 增量（注册 / IPsec / MT 短信监听 / MO 短信接管）。
+与官方的精确差异见 [UPSTREAM.md](UPSTREAM.md)。
+
+### 部署（三种方式）
+
+| 场景 | 命令 |
+|---|---|
+| 一键部署/升级（已有旧部署） | `curl -fsSL https://github.com/jianglihai/simadmin-volte/releases/download/v1.1.12/deploy.sh \| bash` |
+| 独立安装（全新设备） | `curl -fsSL https://github.com/jianglihai/simadmin-volte/releases/download/v1.1.12/install.sh \| sh` |
+| 指定版本 / 离线包 | `bash deploy.sh v1.1.12` 或 `bash deploy.sh <tar.gz URL>` |
+
+部署内容为 OTA 包全量文件（二进制 + 前端 + volte_register/volte_sms_send/qmi.py
++ systemd 单元），全量备份、可全量回滚。前端「电话管理」页可查看
+VoLTE 注册状态与开关；注册成功后短信自动经 IMS 收发（CS 域兜底）。
+
+### 从官方新版本同步
+
+```bash
+bash scripts/sync-upstream.sh   # 自动同步无冲突文件，报告需人工合并的 14 个文件
+```
+
 ### 📦 参考项目
 
 - [project-cpe](https://github.com/1orz/project-cpe)
