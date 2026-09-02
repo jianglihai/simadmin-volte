@@ -31,6 +31,7 @@ sys.path.insert(0, "/opt/simadmin")
 sys.path.insert(1, "/root")
 from qmi import Qmi, SVC_UIM, USIM_AID  # noqa: E402
 
+# 默认值为 001B（联通）；_setup_identity() 会按 SIM 实际 IMSI 覆盖
 IMSI = "460018558516337"
 DOMAIN = "ims.mnc001.mcc460.3gppnetwork.org"
 URI = "sip:" + DOMAIN
@@ -64,7 +65,62 @@ def dec_groups_to_ip(groups):
     return None
 
 
-def discover_pcscf(iface=None):
+def discover_identity():
+    """从 SIM 读 IMSI（001B=460018... 联通 / J003=460115... 电信）。"""
+    sim_path = sh("mmcli -m any 2>/dev/null | "
+                  "grep -oE '/org/freedesktop/ModemManager1/SIM/[0-9]+' | head -1")
+    if sim_path:
+        idx = sim_path.strip().rstrip("/").split("/")[-1]
+        r = sh("mmcli -i %s 2>/dev/null" % idx)
+        m = re.search(r"imsi:\s*(\d{6,15})", r, re.I)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _setup_identity():
+    """按 SIM 推导 IMSI/DOMAIN。MNC 长度以 mmcli operator code 为准
+    （电信 46011 -> MNC 011；联通 46001 -> 001），zfill 补足三位。"""
+    global IMSI, DOMAIN, URI
+    imsi = discover_identity()
+    if not imsi or len(imsi) < 7:
+        return
+    IMSI = imsi
+    op = sh("mmcli -m any 2>/dev/null | grep -iE 'operator code' | "
+            "grep -oE '[0-9]{5,6}' | head -1")
+    if op and len(op) > 3:
+        mnc = op[3:].zfill(3)
+    elif imsi.startswith("460") and imsi[3] != "0":
+        mnc = ("0" + imsi[3:5]).zfill(3)
+    else:
+        mnc = imsi[3:6]
+    DOMAIN = "ims.mnc%s.mcc%s.3gppnetwork.org" % (mnc, imsi[:3])
+    URI = "sip:" + DOMAIN
+    log("身份: IMSI=%s domain=%s" % (IMSI, DOMAIN))
+
+
+def ensure_ims_context():
+    """确保存在 apn=ims 的 IPv6 PDP 上下文并激活；返回 cid。
+    重启后模组可能只剩厂商默认上下文（J003: ctlte/ctwap，无 ims）。"""
+    r = sh("mmcli -m any --command='AT+CGDCONT?'")
+    cid = None
+    for line in r.splitlines():
+        m = re.search(r'\+CGDCONT:\s*(\d+),"[^"]*","ims"', line, re.I)
+        if m:
+            cid = int(m.group(1))
+            break
+    if cid is None:
+        used = [int(m.group(1)) for m in re.finditer(r"\+CGDCONT:\s*(\d+)", r)]
+        cid = (max(used) + 1) if used else 3
+        sh('mmcli -m any --command=\'AT+CGDCONT=%d,"IPV6","ims"\'' % cid)
+        log("已定义 IMS 上下文 CID=%d" % cid)
+    sh("mmcli -m any --command='AT+CGACT=1,%d'" % cid)
+    time.sleep(4)
+    log("IMS 上下文 CID=%d 已激活" % cid)
+    return cid
+
+
+def discover_pcscf(iface=None, ims_cid=None):
     """APN=ims 的 CGCONTRDP 里的 P-CSCF 优先，静态候选兜底，ping 验证。
     CGCONTRDP 前几个地址字段是 local/gw/dns（TS 27.007），P-CSCF 从
     第 8 个字段（索引 7）开始；且必须排除 UE 本机地址，否则自己 ping
@@ -81,7 +137,8 @@ def discover_pcscf(iface=None):
             local_addrs.add(_x.split("/")[0])
     at_cands = []   # 网络经 CGCONTRDP 上报 = 权威，不要求 ping 可达
     static_cands = []
-    for cid in (2, 3, 4, 1):
+    for cid in ([ims_cid] if ims_cid else []) + [c for c in (2, 3, 4, 1)
+                                                 if c != ims_cid]:
         r = sh("mmcli -m any --command='AT+CGCONTRDP=%d'" % cid, t=15)
         for line in r.splitlines():
             if "+CGCONTRDP:" not in line:
@@ -310,6 +367,7 @@ def sip_exchange(transport, ue, pcscf, dst_port, packet, timeout, local_port):
 
 
 def register(pcscf, ue, iface="wwan0"):
+    _setup_identity()
     sh("ip link set %s up 2>/dev/null" % iface)
     # 必须先清残留 xfrm：否则 OUT 策略会把明文 REGISTER#1 也包成 ESP，
     # P-CSCF 对"已注册+受保护但无新质询"的包直接丢弃（超时）
@@ -475,6 +533,7 @@ def register(pcscf, ue, iface="wwan0"):
 def main():
     pcscf = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] else None
     ue = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else None
+    _setup_identity()
     iface = None
     if not ue:
         iface, ue = discover_ue()
@@ -482,7 +541,8 @@ def main():
         # 必须先清残留 xfrm：旧 IN 策略会丢弃 P-CSCF 的明文 ICMP 应答，
         # 导致 ping 探测全部失败；旧 OUT 策略会把明文 REGISTER#1 包成 ESP
         sh("ip xfrm state flush; ip xfrm policy flush")
-        pcscf = discover_pcscf(iface)
+        ims_cid = ensure_ims_context()
+        pcscf = discover_pcscf(iface, ims_cid)
     if not ue or not pcscf:
         print(json.dumps({"registered": False, "pcscf": pcscf or "",
                           "ue_addr": ue or "",
