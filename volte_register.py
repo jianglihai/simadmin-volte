@@ -48,8 +48,14 @@ CANDIDATES = [
 
 
 def dec_groups_to_ip(groups):
-    """AT+CGCONTRDP 的十进制组地址（16 段=IPv6, 4 段=IPv4）转文本。"""
-    nums = [int(x) for x in groups]
+    """AT+CGCONTRDP 的十进制组地址（16 段=IPv6, 4 段=IPv4）转文本。
+    mmcli 响应带首尾引号（...116'），token 需剔除非数字。"""
+    clean = []
+    for x in groups:
+        x = re.sub(r"[^0-9]", "", x)
+        if x != "":
+            clean.append(int(x))
+    nums = clean
     if len(nums) == 16:
         return ":".join("%x" % (nums[i] * 256 + nums[i + 1])
                         for i in range(0, 16, 2))
@@ -58,34 +64,72 @@ def dec_groups_to_ip(groups):
     return None
 
 
-def discover_pcscf():
-    """APN=ims 的 CGCONTRDP 里的 P-CSCF 优先，静态候选兜底，ping 验证。"""
-    cands = []
+def discover_pcscf(iface=None):
+    """APN=ims 的 CGCONTRDP 里的 P-CSCF 优先，静态候选兜底，ping 验证。
+    CGCONTRDP 前几个地址字段是 local/gw/dns（TS 27.007），P-CSCF 从
+    第 8 个字段（索引 7）开始；且必须排除 UE 本机地址，否则自己 ping
+    自己通过会选中本机，REGISTER 发给自己。"""
+    if iface is None:
+        iface, ue0 = (discover_ue() or ("wwan0", None))
+    else:
+        ue0 = None
+    local_addrs = set()
+    for _i in WWAN_IFACES:
+        _a = sh("ip -6 addr show dev %s scope global 2>/dev/null | "
+                "awk '/inet6/{print $2}'" % _i)
+        for _x in _a.split():
+            local_addrs.add(_x.split("/")[0])
+    at_cands = []   # 网络经 CGCONTRDP 上报 = 权威，不要求 ping 可达
+    static_cands = []
     for cid in (2, 3, 4, 1):
         r = sh("mmcli -m any --command='AT+CGCONTRDP=%d'" % cid, t=15)
         for line in r.splitlines():
             if "+CGCONTRDP:" not in line:
                 continue
-            parts = [p.strip() for p in line.split(":", 1)[1].split(",")]
+            parts = [p.strip().strip("'") for p in
+                     line.split(":", 1)[1].split(",")]
             if len(parts) < 3 or "ims" not in parts[2].lower():
                 continue
-            for p in parts:
+            for p in parts[7:]:
                 if p.count(".") >= 3:
                     a = dec_groups_to_ip(p.split("."))
-                    if a and ":" in a and a not in cands:
-                        cands.append(a)
-    cands += [c for c in CANDIDATES if c not in cands]
-    for c in cands:
-        if "time=" in sh("ping6 -c1 -W2 -I wwan1 %s 2>/dev/null" % c):
-            log("P-CSCF 发现: %s" % c)
+                    if a and ":" in a and a not in at_cands:
+                        at_cands.append(a)
+    static_cands += [c for c in CANDIDATES if c not in at_cands]
+
+    def alive(c):
+        return "time=" in sh("ping6 -c1 -W2 -I %s %s 2>/dev/null" % (iface, c))
+
+    # AT 候选：ping 通的优先；电信 P-CSCF 屏蔽 ICMP，ping 不通也直接用
+    reachable = [c for c in at_cands if c not in local_addrs and alive(c)]
+    for c in reachable:
+        log("P-CSCF 发现: %s (ping 通)" % c)
+        return c
+    for c in at_cands:
+        if c not in local_addrs:
+            log("P-CSCF 发现: %s (CGCONTRDP, ping 不通按权威使用)" % c)
+            return c
+    # 静态候选：必须 ping 通（可能是过时的其它运营商地址）
+    for c in static_cands:
+        if c in local_addrs:
+            continue
+        if alive(c):
+            log("P-CSCF 发现: %s (静态候选)" % c)
             return c
     return None
 
 
+WWAN_IFACES = ("wwan0", "wwan1", "wwan2", "wwan3")
+
+
 def discover_ue():
-    r = sh("ip -6 addr show dev wwan1 scope global 2>/dev/null | "
-           "awk '/inet6/{print $2; exit}'")
-    return r.split("/")[0] if r else None
+    """返回 (iface, addr)：第一个带全局 IPv6 的 wwan 口（J003=wwan0, 001B=wwan1）。"""
+    for iface in WWAN_IFACES:
+        r = sh("ip -6 addr show dev %s scope global 2>/dev/null | "
+               "awk '/inet6/{print $2; exit}'" % iface)
+        if r:
+            return iface, r.split("/")[0]
+    return None, None
 
 
 def log(m):
@@ -214,17 +258,73 @@ def build_register(ue, pcscf, cseq, port, tag, callid, authorization=None,
     return "\r\n".join(lines).encode()
 
 
-def register(pcscf, ue):
-    sh("ip link set wwan1 up 2>/dev/null")
+
+def _read_sip_tcp(sock):
+    """TCP 上按 Content-Length 读完一个 SIP 消息。"""
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        d = sock.recv(4096)
+        if not d:
+            return None
+        buf += d
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    clen = 0
+    m = re.search(rb"Content-Length:\s*(\d+)", head, re.I)
+    if m:
+        clen = int(m.group(1))
+    while len(rest) < clen:
+        d = sock.recv(4096)
+        if not d:
+            break
+        rest += d
+    return head + b"\r\n\r\n" + rest
+
+
+def sip_exchange(transport, ue, pcscf, dst_port, packet, timeout, local_port):
+    """发一个 SIP 请求并收响应。UDP：bind local_port 收发；
+    TCP：bind local_port 后 connect，响应走同一连接。返回文本或 None。
+    电信 P-CSCF 实测 UDP 全超时必须 TCP（Unicom 反之），双传输自适应。"""
+    try:
+        if transport == "tcp":
+            s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((ue, local_port))
+            s.settimeout(timeout)
+            s.connect((pcscf, dst_port))
+            s.sendall(packet)
+            resp = _read_sip_tcp(s)
+            s.close()
+            return resp.decode("utf-8", "replace") if resp else None
+        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((ue, local_port))
+        s.settimeout(timeout)
+        s.sendto(packet, (pcscf, dst_port))
+        data, _ = s.recvfrom(16384)
+        s.close()
+        return data.decode("utf-8", "replace")
+    except Exception as e:
+        log("sip_exchange(%s, ->%d, lp=%d): %s"
+            % (transport, dst_port, local_port, e))
+        return None
+
+
+def register(pcscf, ue, iface="wwan0"):
+    sh("ip link set %s up 2>/dev/null" % iface)
     # 必须先清残留 xfrm：否则 OUT 策略会把明文 REGISTER#1 也包成 ESP，
     # P-CSCF 对"已注册+受保护但无新质询"的包直接丢弃（超时）
     sh("ip xfrm state flush; ip xfrm policy flush")
-    sh("ip -6 addr replace %s/64 dev wwan1 2>/dev/null" % ue)
-    gw = sh("ip -6 route show dev wwan1 | grep default | awk '{print $3}'").split()[0:1]
+    sh("ip -6 addr replace %s/64 dev %s 2>/dev/null" % (ue, iface))
+    gw = sh("ip -6 route show dev %s | grep default | awk '{print $3}'" % iface).split()[0:1]
     gw = gw[0] if gw else None
     if gw:
-        sh("ip -6 route replace %s/128 via %s dev wwan1 metric 5 2>/dev/null"
-           % (pcscf, gw))
+        sh("ip -6 route replace %s/128 via %s dev %s metric 5 2>/dev/null"
+           % (pcscf, gw, iface))
+    else:
+        # 无默认路由（J003 电信模组不发 RA 路由）：on-link 直发，
+        # POINTOPOINT+NOARP 口内核不做 ND，帧直达模组
+        sh("ip -6 route replace %s/128 dev %s onlink metric 5 2>/dev/null"
+           % (pcscf, iface))
 
     callid = md5h(str(time.time()).encode())
     tag = md5h(callid.encode())[:8]
@@ -238,29 +338,32 @@ def register(pcscf, ue):
     reg1 = build_register(ue, pcscf, 1, 5060, tag, callid,
                           authorization=auth_empty, scli=scli)
 
-    sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((ue, 5060))
-    sock.settimeout(12)
-    sec_server = ""
+    # 传输自适应：UDP 先试（Unicom 实证），无响应自动切 TCP（电信实证）
+    transport = None
+    text = ""
     nonce = ""
-    try:
-        sock.sendto(reg1, (pcscf, 5060))
-        log("REGISTER#1 sent")
-        data, _ = sock.recvfrom(8192)
-        text = data.decode("utf-8", "replace")
-        log("REGISTER#1 <- %s" % text.split("\r\n", 1)[0])
-        m = re.search(r'nonce="([^"]+)"', text)
-        if not m or sip_status(text) not in (401, 421):
-            raise RuntimeError("REGISTER#1: %s" % text.split("\r\n", 1)[0])
-        nonce = m.group(1)
-        sec_server = re.search(
-            r"Security-Server: ipsec-3gpp;(.*)", text).group(1).strip()
-        pc_spi_s = int(re.search(r"spi-s=(\d+)", sec_server).group(1))
-        pc_port_s = int(re.search(r"port-s=(\d+)", sec_server).group(1))
-        log("Security-Server: spi-s=%d port-s=%d" % (pc_spi_s, pc_port_s))
-    finally:
-        sock.close()
+    sec_server = ""
+    for tr in ("udp", "tcp"):
+        resp = sip_exchange(tr, ue, pcscf, 5060, reg1, 10, 5060)
+        if not resp:
+            log("REGISTER#1 via %s: 无响应" % tr)
+            continue
+        text = resp
+        transport = tr
+        log("REGISTER#1(%s) <- %s" % (tr, text.split("\r\n", 1)[0]))
+        break
+    if transport is None:
+        raise RuntimeError("REGISTER#1: UDP/TCP 均无响应")
+    m = re.search(r'nonce="([^"]+)"', text)
+    if not m or sip_status(text) not in (401, 421):
+        raise RuntimeError("REGISTER#1: %s" % text.split("\r\n", 1)[0])
+    nonce = m.group(1)
+    sec_server = re.search(
+        r"Security-Server: ipsec-3gpp;(.*)", text).group(1).strip()
+    pc_spi_s = int(re.search(r"spi-s=(\d+)", sec_server).group(1))
+    pc_port_s = int(re.search(r"port-s=(\d+)", sec_server).group(1))
+    log("Security-Server: spi-s=%d port-s=%d (transport=%s)"
+        % (pc_spi_s, pc_port_s, transport))
     service_route = ""
 
     res = ck = ik = None
@@ -290,15 +393,10 @@ def register(pcscf, ue):
                                       branch="branch=z9hG4bK"
                                       + md5h((callid + str(attempt)
                                               + "sync").encode()))
-            s2 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-            s2.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s2.bind((ue, 5060))
-            s2.settimeout(12)
             got_new_nonce = False
-            try:
-                s2.sendto(reg_sync, (pcscf, 5060))
-                data, _ = s2.recvfrom(8192)
-                text = data.decode("utf-8", "replace")
+            resp = sip_exchange(transport, ue, pcscf, 5060, reg_sync, 12, 5060)
+            if resp:
+                text = resp
                 log("重同步 <- %s" % text.split("\r\n", 1)[0])
                 m = re.search(r'nonce="([^"]+)"', text)
                 if m and m.group(1) != nonce and sip_status(text) in (401, 421):
@@ -307,8 +405,6 @@ def register(pcscf, ue):
                         r"Security-Server: ipsec-3gpp;(.*)",
                         text).group(1).strip()
                     got_new_nonce = True
-            finally:
-                s2.close()
             if got_new_nonce:
                 log("拿到新 nonce，重新 AKA")
                 continue
@@ -340,45 +436,53 @@ def register(pcscf, ue):
                           branch="branch=z9hG4bK"
                           + md5h((callid + "reg2").encode()))
 
-    cli = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-    cli.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    cli.bind((ue, UE_PORT_C))
-    srv = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((ue, UE_PORT_S))
-    srv.settimeout(15)
-    try:
-        cli.sendto(reg2, (pcscf, pc_port_s))
-        log("REGISTER#2 (protected) %d -> %d" % (UE_PORT_C, pc_port_s))
-        data, addr = srv.recvfrom(8192)
-        text = data.decode("utf-8", "replace")
-        log("REGISTER#2 <- %s: %s" % (addr[0], text.split("\r\n", 1)[0]))
-        if "SIP/2.0 200" not in text:
-            raise RuntimeError("REGISTER#2: %s" % text.split("\r\n", 1)[0])
-        m = re.search(r"Service-Route:\s*(\S+)", text)
-        service_route = m.group(1) if m else ""
-        # 默认 IMPU = P-Associated-URI 里第一个 sip:+ 形式（MO 短信用）
-        impu = ""
-        m = re.search(r"P-Associated-URI:\s*<sip:\+[^>]+>", text)
-        if m:
-            impu = m.group(0).split("<", 1)[1].rstrip(">")
-        log(">>> IMS REGISTERED OK <<<")
-        return True, None, service_route, impu
-    finally:
-        cli.close()
-        srv.close()
+    if transport == "tcp":
+        text = sip_exchange("tcp", ue, pcscf, pc_port_s, reg2, 15,
+                            UE_PORT_C) or ""
+        log("REGISTER#2(protected/tcp) -> %d" % pc_port_s)
+        if text:
+            log("REGISTER#2 <- %s" % text.split("\r\n", 1)[0])
+    else:
+        cli = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        cli.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        cli.bind((ue, UE_PORT_C))
+        srv = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind((ue, UE_PORT_S))
+        srv.settimeout(15)
+        try:
+            cli.sendto(reg2, (pcscf, pc_port_s))
+            log("REGISTER#2 (protected) %d -> %d" % (UE_PORT_C, pc_port_s))
+            data, addr = srv.recvfrom(8192)
+            text = data.decode("utf-8", "replace")
+            log("REGISTER#2 <- %s: %s" % (addr[0], text.split("\r\n", 1)[0]))
+        finally:
+            cli.close()
+            srv.close()
+    if "SIP/2.0 200" not in text:
+        raise RuntimeError("REGISTER#2: %s" % text.split("\r\n", 1)[0])
+    m = re.search(r"Service-Route:\s*(\S+)", text)
+    service_route = m.group(1) if m else ""
+    # 默认 IMPU = P-Associated-URI 里第一个 sip:+ 形式（MO 短信用）
+    impu = ""
+    m = re.search(r"P-Associated-URI:\s*<sip:\+[^>]+>", text)
+    if m:
+        impu = m.group(0).split("<", 1)[1].rstrip(">")
+    log(">>> IMS REGISTERED OK <<<")
+    return True, None, service_route, impu
 
 
 def main():
     pcscf = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] else None
     ue = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else None
+    iface = None
     if not ue:
-        ue = discover_ue()
+        iface, ue = discover_ue()
     if not pcscf:
         # 必须先清残留 xfrm：旧 IN 策略会丢弃 P-CSCF 的明文 ICMP 应答，
         # 导致 ping 探测全部失败；旧 OUT 策略会把明文 REGISTER#1 包成 ESP
         sh("ip xfrm state flush; ip xfrm policy flush")
-        pcscf = discover_pcscf()
+        pcscf = discover_pcscf(iface)
     if not ue or not pcscf:
         print(json.dumps({"registered": False, "pcscf": pcscf or "",
                           "ue_addr": ue or "",
@@ -386,7 +490,7 @@ def main():
                                    % (ue, pcscf)}, ensure_ascii=False))
         return 1
     try:
-        ok, err, _sr, _impu = register(pcscf, ue)
+        ok, err, _sr, _impu = register(pcscf, ue, iface or "wwan0")
     except Exception as e:
         ok, err = False, str(e)
         log("注册失败: %s" % e)
